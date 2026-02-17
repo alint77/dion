@@ -146,6 +146,57 @@ class NorMuon(Optimizer):
         else:
             self._newton_schulz_func = zeropower_via_newtonschulz5
 
+        # Persistent CPU scalar tensors, allocated once and updated in-place via fill_().
+        # Avoids per-step torch.tensor() Python object creation and GC pressure.
+        # CPU fill_() is a pure memory write — no CUDA kernel launch.
+        self._persistent_hparams: Optional[dict] = None
+
+        # Pre-allocated communication buffers for NCCL collectives.
+        # Keyed by batch index so each unique parameter batch gets its own buffer.
+        # This eliminates per-step torch.empty_like() allocations inside the optimizer.
+        self._comm_buffers: dict = {}
+
+    def _ensure_persistent_hparams(self):
+        """Allocate persistent CPU scalar tensors for hyperparameters."""
+        if self._persistent_hparams is not None:
+            return
+        hp = {}
+        for i, group in enumerate(self.param_groups):
+            prefix = f"group_{i}"
+            hp[f"{prefix}_lr"] = torch.tensor(group["lr"])
+            hp[f"{prefix}_weight_decay"] = torch.tensor(group["weight_decay"])
+            hp[f"{prefix}_epsilon"] = torch.tensor(group["epsilon"])
+
+            algo = group.get("algorithm", "normuon")
+            if algo == "normuon":
+                hp[f"{prefix}_momentum"] = torch.tensor(group["mu"])
+                hp[f"{prefix}_muon_beta2"] = torch.tensor(group["muon_beta2"])
+            elif algo in ("adamw", "lion"):
+                hp[f"{prefix}_beta1"] = torch.tensor(group["beta1"])
+                hp[f"{prefix}_beta2"] = torch.tensor(group["beta2"])
+            if algo == "adamw":
+                hp[f"{prefix}_step"] = torch.tensor(group["step"])
+        self._persistent_hparams = hp
+
+    def _sync_persistent_hparams(self):
+        """Copy current param_group values into persistent CPU tensors."""
+        hp = self._persistent_hparams
+        for i, group in enumerate(self.param_groups):
+            prefix = f"group_{i}"
+            hp[f"{prefix}_lr"].fill_(group["lr"])
+            hp[f"{prefix}_weight_decay"].fill_(group["weight_decay"])
+            hp[f"{prefix}_epsilon"].fill_(group["epsilon"])
+
+            algo = group.get("algorithm", "normuon")
+            if algo == "normuon":
+                hp[f"{prefix}_momentum"].fill_(group["mu"])
+                hp[f"{prefix}_muon_beta2"].fill_(group["muon_beta2"])
+            elif algo in ("adamw", "lion"):
+                hp[f"{prefix}_beta1"].fill_(group["beta1"])
+                hp[f"{prefix}_beta2"].fill_(group["beta2"])
+            if algo == "adamw":
+                hp[f"{prefix}_step"].fill_(group["step"])
+
     @torch.no_grad()
     def step(self, closure=None):
         """
@@ -175,6 +226,10 @@ class NorMuon(Optimizer):
             else:
                 raise ValueError(f"Unknown algorithm: {algo}")
 
+        # Initialize / update persistent hparam tensors (CPU, no CUDA kernels)
+        self._ensure_persistent_hparams()
+        self._sync_persistent_hparams()
+
         # Create async tasks for each algorithm
         normuon_tasks = self._create_normuon_tasks(normuon_groups)
         lion_tasks = self._create_lion_tasks(lion_groups)
@@ -200,6 +255,28 @@ class NorMuon(Optimizer):
                 state["variance_neuron"] = torch.zeros_like(param[..., 0:1])
         return state
 
+    def _get_group_index(self, group: dict) -> int:
+        """Return the index of a param group in self.param_groups."""
+        for i, g in enumerate(self.param_groups):
+            if g is group:
+                return i
+        raise RuntimeError("param group not found")
+
+    def _get_hparam(self, group_idx: int, name: str) -> Tensor:
+        """Get a persistent hparam tensor, or create a CPU tensor as fallback."""
+        if self._persistent_hparams is not None:
+            key = f"group_{group_idx}_{name}"
+            if key in self._persistent_hparams:
+                return self._persistent_hparams[key]
+        # Fallback for groups without persistent hparams
+        group = self.param_groups[group_idx]
+        val_map = {
+            "lr": "lr", "weight_decay": "weight_decay", "epsilon": "epsilon",
+            "momentum": "mu", "muon_beta2": "muon_beta2",
+            "beta1": "beta1", "beta2": "beta2", "step": "step",
+        }
+        return torch.tensor(group[val_map[name]])
+
     def _create_normuon_tasks(
         self,
         param_groups: List[dict],
@@ -209,6 +286,7 @@ class NorMuon(Optimizer):
         Helper function to create batches of NorMuon matrices and generate
         AsyncTask objects so we can process multiple batches concurrently.
         """
+        batch_idx = 0
         for group in param_groups:
             assert group["algorithm"] == algo_name
             assert all(
@@ -219,13 +297,14 @@ class NorMuon(Optimizer):
             if not group_params:
                 continue
 
-            # Wrap hyperparameters in tensors for torch.compile
+            gi = self._get_group_index(group)
+            # Use persistent device tensors to avoid per-step torch.tensor() allocations
             normuon_update_args = dict(
-                lr=torch.tensor(group["lr"]),
-                momentum=torch.tensor(group["mu"]),
-                muon_beta2=torch.tensor(group["muon_beta2"]),
-                weight_decay=torch.tensor(group["weight_decay"]),
-                epsilon=torch.tensor(group["epsilon"]),
+                lr=self._get_hparam(gi, "lr"),
+                momentum=self._get_hparam(gi, "momentum"),
+                muon_beta2=self._get_hparam(gi, "muon_beta2"),
+                weight_decay=self._get_hparam(gi, "weight_decay"),
+                epsilon=self._get_hparam(gi, "epsilon"),
                 nesterov=group["nesterov"],
                 flatten=group["flatten"],
                 adjust_lr=group["adjust_lr"],
@@ -307,6 +386,21 @@ class NorMuon(Optimizer):
                             f"DTensor has mesh: {params[0].device_mesh}, placements: {params[0].placements}, but optimizer was created with mesh: {self._distributed_mesh}."
                         )
 
+                # Pre-allocate NCCL recv buffer for this batch (reused across steps).
+                # Buffer shape matches U output from pre_orthogonalize (bf16 of local grad shape).
+                padded_params = pad_batch(params, self._world_size)
+                buf_key = f"normuon_{batch_idx}"
+                comm_buf = self._comm_buffers.get(buf_key)
+                if comm_buf is None:
+                    # Lazily create the buffer on first step using the local tensor shape
+                    local_p = to_local(padded_params[0]) if isinstance(padded_params[0], DTensor) else padded_params[0]
+                    comm_buf = [
+                        torch.empty(local_p.shape, dtype=torch.bfloat16, device=local_p.device)
+                        for _ in range(len(padded_params))
+                    ]
+                    self._comm_buffers[buf_key] = comm_buf
+                batch_idx += 1
+
                 # Special case for 3D tensors sharded along batch dimension
                 # As long as matrix dimensions are not sharded, each device will have whole matrices
                 # Each device already has different matrices of the batch, so we can't parallelize further
@@ -328,11 +422,12 @@ class NorMuon(Optimizer):
                 else:
                     yield AsyncTask(
                         normuon_update_batch_async(
-                            X=pad_batch(params, self._world_size),
+                            X=padded_params,
                             G=pad_batch(gradients, self._world_size),
                             M=pad_batch(momentums, self._world_size),
                             V=pad_batch(variances_neuron, self._world_size),
                             shard_dim=sharded_tensor_dim,
+                            comm_recv_buf=comm_buf,
                             **normuon_update_args,
                         )
                     )
@@ -356,23 +451,17 @@ class NorMuon(Optimizer):
             states = [self._get_or_initialize_state(p, algo_name) for p in params]
             momentums = [s["momentum"] for s in states]
 
-            # Wrap hyperparameters in tensors for torch.compile
-            lr = torch.tensor(group["lr"])
-            beta1 = torch.tensor(group["beta1"])
-            beta2 = torch.tensor(group["beta2"])
-            weight_decay = torch.tensor(group["weight_decay"])
-            cautious_wd = group["cautious_wd"]
-
+            gi = self._get_group_index(group)
             yield AsyncTask(
                 lion_update_foreach_async(
                     X=to_local(params),
                     G=to_local(gradients),
                     M=to_local(momentums),
-                    lr=lr,
-                    beta1=beta1,
-                    beta2=beta2,
-                    weight_decay=weight_decay,
-                    cautious_wd=cautious_wd,
+                    lr=self._get_hparam(gi, "lr"),
+                    beta1=self._get_hparam(gi, "beta1"),
+                    beta2=self._get_hparam(gi, "beta2"),
+                    weight_decay=self._get_hparam(gi, "weight_decay"),
+                    cautious_wd=group["cautious_wd"],
                 )
             )
 
@@ -396,28 +485,20 @@ class NorMuon(Optimizer):
             momentums = [s["momentum"] for s in states]
             variances = [s["variance"] for s in states]
 
-            # Wrap hyperparameters in tensors for torch.compile
-            lr = torch.tensor(group["lr"])
-            beta1 = torch.tensor(group["beta1"])
-            beta2 = torch.tensor(group["beta2"])
-            weight_decay = torch.tensor(group["weight_decay"])
-            cautious_wd = group["cautious_wd"]
-            epsilon = torch.tensor(group["epsilon"])
-            step = torch.tensor(group["step"])
-
+            gi = self._get_group_index(group)
             yield AsyncTask(
                 adamw_update_foreach_async(
                     X=to_local(params),
                     G=to_local(gradients),
                     M=to_local(momentums),
                     V=to_local(variances),
-                    lr=lr,
-                    beta1=beta1,
-                    beta2=beta2,
-                    weight_decay=weight_decay,
-                    step=step,
-                    epsilon=epsilon,
-                    cautious_wd=cautious_wd,
+                    lr=self._get_hparam(gi, "lr"),
+                    beta1=self._get_hparam(gi, "beta1"),
+                    beta2=self._get_hparam(gi, "beta2"),
+                    weight_decay=self._get_hparam(gi, "weight_decay"),
+                    step=self._get_hparam(gi, "step"),
+                    epsilon=self._get_hparam(gi, "epsilon"),
+                    cautious_wd=group["cautious_wd"],
                 )
             )
 
@@ -441,6 +522,7 @@ def normuon_update_batch_async(
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
     cautious_wd: bool = False,
+    comm_recv_buf: Optional[List[Tensor]] = None,  # Pre-allocated recv buffer for NCCL
 ) -> Generator[None, None, None]:
     """
     Batched version of Muon update. Batch size should be equal to number of GPUs.
@@ -473,8 +555,8 @@ def normuon_update_batch_async(
             X[0].size(shard_dim) % world_size == 0
         ), f"Shard dimension {shard_dim} size {X[0].size(shard_dim)} is not divisible by world size {world_size}."
 
-        # Allocate buffers to receive shards of one whole matrix from other devices
-        single_matrix_shards = [torch.empty_like(u) for u in U]
+        # Use pre-allocated buffers to receive shards (avoids per-step allocation)
+        single_matrix_shards = comm_recv_buf if comm_recv_buf is not None else [torch.empty_like(u) for u in U]
 
         # Redistribute the shards to form one unique full tensor on each device
         work = dist.all_to_all(
@@ -523,8 +605,8 @@ def normuon_update_batch_async(
             epsilon=epsilon,
         )
 
-        # Allocate empty tensors to receive updates from other devices
-        U = [torch.empty_like(u) for u in U]
+        # Use pre-allocated buffers for all_gather recv (avoids per-step allocation)
+        U = comm_recv_buf if comm_recv_buf is not None else [torch.empty_like(u) for u in U]
 
         # All gather orthogonalized results from other devices into buffer
         work = dist.all_gather(
