@@ -1,6 +1,122 @@
+from collections import defaultdict
+from typing import Generator, List
+
 import torch
 from torch import Tensor
-from typing import Generator, List
+from torch.optim.adamw import adamw as torch_adamw
+
+SCALAR_BACKENDS = ("auto", "fused", "foreach")
+
+
+def validate_scalar_backend(scalar_backend: str) -> str:
+    if scalar_backend not in SCALAR_BACKENDS:
+        raise ValueError(
+            f"Invalid scalar_backend: {scalar_backend}. "
+            f"Expected one of {SCALAR_BACKENDS}."
+        )
+    return scalar_backend
+
+
+def _as_float(value: float | Tensor) -> float:
+    return float(value.item()) if isinstance(value, Tensor) else float(value)
+
+
+def _as_int(value: int | Tensor) -> int:
+    return int(value.item()) if isinstance(value, Tensor) else int(value)
+
+
+def _to_scalar_tensor(value: float | Tensor, *, device: torch.device) -> Tensor:
+    if isinstance(value, Tensor):
+        return value
+    return torch.tensor(value, device=device)
+
+
+def _fused_adamw_support_reason(
+    X: List[Tensor],
+    G: List[Tensor],
+    M: List[Tensor],
+    V: List[Tensor],
+    cautious_wd: bool,
+) -> str | None:
+    if cautious_wd:
+        return "cautious_wd=True is only implemented by Dion's foreach AdamW path"
+    if not X:
+        return "empty parameter list"
+    tensors = [*X, *G, *M, *V]
+    if not all(isinstance(t, Tensor) for t in tensors):
+        return "all inputs must be tensors"
+    if not all(t.device.type == "cuda" for t in tensors):
+        return "fused AdamW requires CUDA tensors"
+    if not all(torch.is_floating_point(t) and not torch.is_complex(t) for t in tensors):
+        return "fused AdamW requires real floating-point tensors"
+    if any(g.is_sparse for g in G):
+        return "fused AdamW does not support sparse gradients"
+    return None
+
+
+def _adamw_update_fused(
+    X: List[Tensor],
+    G: List[Tensor],
+    M: List[Tensor],
+    V: List[Tensor],
+    lr: float | Tensor,
+    beta1: float | Tensor,
+    beta2: float | Tensor,
+    weight_decay: float | Tensor,
+    step: int | Tensor,
+    epsilon: float | Tensor,
+) -> None:
+    grouped_indices: dict[tuple[torch.device, torch.dtype], list[int]] = defaultdict(list)
+    for idx, param in enumerate(X):
+        grouped_indices[(param.device, param.dtype)].append(idx)
+
+    lr = _as_float(lr)
+    beta1 = _as_float(beta1)
+    beta2 = _as_float(beta2)
+    weight_decay = _as_float(weight_decay)
+    step = _as_int(step)
+    epsilon = _as_float(epsilon)
+
+    for (device, _dtype), indices in grouped_indices.items():
+        params = [X[i] for i in indices]
+        grads = [G[i] for i in indices]
+        exp_avgs = [M[i] for i in indices]
+        exp_avg_sqs = [V[i] for i in indices]
+
+        # Fused AdamW tracks a per-parameter step tensor internally. Dion keeps
+        # one scalar step per param-group, so create an ephemeral vector at the
+        # prior step value and let the functional kernel advance it once.
+        state_steps = list(
+            torch.full(
+                (len(indices),),
+                float(step - 1),
+                device=device,
+                dtype=torch.float32,
+            ).unbind(0)
+        )
+
+        torch_adamw(
+            params=params,
+            grads=grads,
+            exp_avgs=exp_avgs,
+            exp_avg_sqs=exp_avg_sqs,
+            max_exp_avg_sqs=[],
+            state_steps=state_steps,
+            foreach=False,
+            capturable=False,
+            differentiable=False,
+            fused=True,
+            grad_scale=None,
+            found_inf=None,
+            has_complex=False,
+            amsgrad=False,
+            beta1=beta1,
+            beta2=beta2,
+            lr=lr,
+            weight_decay=weight_decay,
+            eps=epsilon,
+            maximize=False,
+        )
 
 
 @torch.compile(fullgraph=True)
@@ -186,6 +302,66 @@ def adamw_update_foreach(
     torch._foreach_sub_(X, M_div)
 
 
+def adamw_update_auto(
+    X: List[Tensor],
+    G: List[Tensor],
+    M: List[Tensor],
+    V: List[Tensor],
+    lr: float | Tensor,
+    beta1: float | Tensor,
+    beta2: float | Tensor,
+    weight_decay: float | Tensor,
+    step: int | Tensor,
+    epsilon: float | Tensor,
+    cautious_wd: bool = False,
+    scalar_backend: str = "auto",
+):
+    """
+    AdamW update that prefers PyTorch's native fused CUDA kernel when possible.
+
+    The current Dion foreach implementation is kept as a correctness-preserving
+    fallback for CPU tensors and cautious weight decay.
+    """
+    scalar_backend = validate_scalar_backend(scalar_backend)
+    support_reason = _fused_adamw_support_reason(X, G, M, V, cautious_wd)
+    use_fused = support_reason is None
+
+    if scalar_backend == "fused" and not use_fused:
+        raise RuntimeError(
+            "scalar_backend='fused' requested, but fused AdamW is unavailable: "
+            f"{support_reason}"
+        )
+    if scalar_backend == "foreach" or (scalar_backend == "auto" and not use_fused):
+        scalar_device = X[0].device if X else torch.device("cpu")
+        adamw_update_foreach(
+            X=X,
+            G=G,
+            M=M,
+            V=V,
+            lr=_to_scalar_tensor(lr, device=scalar_device),
+            beta1=_to_scalar_tensor(beta1, device=scalar_device),
+            beta2=_to_scalar_tensor(beta2, device=scalar_device),
+            weight_decay=_to_scalar_tensor(weight_decay, device=scalar_device),
+            step=step,
+            epsilon=epsilon,
+            cautious_wd=cautious_wd,
+        )
+        return
+
+    _adamw_update_fused(
+        X=X,
+        G=G,
+        M=M,
+        V=V,
+        lr=lr,
+        beta1=beta1,
+        beta2=beta2,
+        weight_decay=weight_decay,
+        step=step,
+        epsilon=epsilon,
+    )
+
+
 @torch.compile(fullgraph=True)
 def lion_update_foreach(
     X: List[Tensor],  # Model weights (modified in place)
@@ -237,6 +413,37 @@ def lion_update_foreach(
     # X = X - lr * U
     torch._foreach_mul_(U, lr)
     torch._foreach_sub_(X, U)
+
+
+def adamw_update_async(
+    X: List[Tensor],
+    G: List[Tensor],
+    M: List[Tensor],
+    V: List[Tensor],
+    lr: Tensor,
+    beta1: Tensor,
+    beta2: Tensor,
+    weight_decay: Tensor,
+    step: int,
+    epsilon: float,
+    cautious_wd: bool = False,
+    scalar_backend: str = "auto",
+) -> Generator[None, None, None]:
+    adamw_update_auto(
+        X=X,
+        G=G,
+        M=M,
+        V=V,
+        lr=lr,
+        beta1=beta1,
+        beta2=beta2,
+        weight_decay=weight_decay,
+        step=step,
+        epsilon=epsilon,
+        cautious_wd=cautious_wd,
+        scalar_backend=scalar_backend,
+    )
+    yield
 
 
 def adamw_update_foreach_async(

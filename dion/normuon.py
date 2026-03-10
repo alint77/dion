@@ -17,7 +17,11 @@ from .opt_utils import (
     pad_batch,
     to_local,
 )
-from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
+from .scalar_opts import (
+    adamw_update_async,
+    lion_update_foreach_async,
+    validate_scalar_backend,
+)
 
 # Reuse Muon's helper functions
 from .muon import (
@@ -44,7 +48,8 @@ class NorMuon(Optimizer):
         muon_beta2: Second beta parameter for NorMuon algorithm's adaptive updates.
         betas: Tuple of (beta1, beta2) for AdamW and Lion algorithms.
         weight_decay: Weight decay factor.
-        cautious_wd: Whether to apply weight decay only where update and parameter signs align.
+        cautious_wd: Whether to apply weight decay only where update and parameter signs align
+            for matrix-style NorMuon updates. AdamW scalar groups always use standard AdamW decay.
         epsilon: Small value to avoid division by zero.
         nesterov: Whether to use Nesterov momentum.
         adjust_lr: How to adjust the learning rate for Muon updates ("spectral_norm" or "rms_norm" or None).
@@ -57,6 +62,8 @@ class NorMuon(Optimizer):
         use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is `func(input: Tensor, epsilon: float) -> Tensor`.
+        scalar_backend: Backend for AdamW scalar parameter groups.
+            "auto" prefers PyTorch's fused CUDA AdamW and falls back to Dion's foreach path.
 
     Muon optimizer algorithm by Keller Jordan: https://kellerjordan.github.io/posts/muon/
     FSDP2 Muon uses all-to-all communications: https://www.essential.ai/blog/infra
@@ -79,6 +86,7 @@ class NorMuon(Optimizer):
         flatten: bool = False,
         use_triton: bool = False,
         newton_schulz_func: Optional[Callable] = None,
+        scalar_backend: str = "auto",
     ):
         # Check hyperparameters
         if lr < 0.0:
@@ -93,6 +101,7 @@ class NorMuon(Optimizer):
             raise ValueError(
                 f"Invalid adjust_lr value: {adjust_lr}. Must be 'spectral_norm', 'rms_norm', or None."
             )
+        scalar_backend = validate_scalar_backend(scalar_backend)
 
         # Default arguments for each param group
         defaults = dict(
@@ -109,6 +118,7 @@ class NorMuon(Optimizer):
             nesterov=nesterov,
             flatten=flatten,
             adjust_lr=adjust_lr,
+            scalar_backend=scalar_backend,
         )
         super().__init__(params, defaults)
 
@@ -395,17 +405,19 @@ class NorMuon(Optimizer):
             momentums = [s["momentum"] for s in states]
             variances = [s["variance"] for s in states]
 
-            # Wrap hyperparameters in tensors for torch.compile
+            # Keep scalar hyperparameters as CPU tensors for the foreach fallback.
+            # The fused AdamW path will unwrap them back to Python scalars.
             lr = torch.tensor(group["lr"])
             beta1 = torch.tensor(group["beta1"])
             beta2 = torch.tensor(group["beta2"])
             weight_decay = torch.tensor(group["weight_decay"])
-            cautious_wd = group["cautious_wd"]
-            epsilon = torch.tensor(group["epsilon"])
-            step = torch.tensor(group["step"])
+            # Cautious weight decay is only applied to matrix-style NorMuon updates.
+            # Scalar AdamW groups always use standard AdamW semantics so they can
+            # take the fused CUDA fast path when available.
+            cautious_wd = False
 
             yield AsyncTask(
-                adamw_update_foreach_async(
+                adamw_update_async(
                     X=to_local(params),
                     G=to_local(gradients),
                     M=to_local(momentums),
@@ -414,9 +426,10 @@ class NorMuon(Optimizer):
                     beta1=beta1,
                     beta2=beta2,
                     weight_decay=weight_decay,
-                    step=step,
-                    epsilon=epsilon,
+                    step=group["step"],
+                    epsilon=group["epsilon"],
                     cautious_wd=cautious_wd,
+                    scalar_backend=group["scalar_backend"],
                 )
             )
 

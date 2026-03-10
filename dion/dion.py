@@ -24,7 +24,7 @@ from .opt_utils import (
     pad_batch,
     to_local,
 )
-from .scalar_opts import adamw_update_foreach, lion_update_foreach
+from .scalar_opts import adamw_update_auto, lion_update_foreach, validate_scalar_backend
 
 
 @dataclass
@@ -90,6 +90,8 @@ class Dion(Optimizer):
             This may be useful to ensure even sharding.
         lr: Base learning rate. For Dion, this will be scaled based on the matrix dimensions.
             For non-Dion algorithms, this is the actual learning rate and no additional scaling is done.
+        scalar_backend: Backend for AdamW scalar parameter groups.
+            "auto" prefers PyTorch's fused CUDA AdamW and falls back to Dion's foreach path.
 
     Note: We assume parameters are all DTensor or all regular Tensors. All sharded tensors are assumed
     to be uniformly sharded - that is, each device along the sharding axis has identical size shards.
@@ -118,6 +120,7 @@ class Dion(Optimizer):
         cqr_warmup_steps: int = 150,  # (ignored)
         rcqr_oversample: float = 1.25,  # Random sketch matrix oversampling for RCQR
         mixed_precision_config: Optional[DionMixedPrecisionConfig] = None,
+        scalar_backend: str = "auto",
     ):
         # Check hyperparameters
         if lr < 0.0:
@@ -136,6 +139,7 @@ class Dion(Optimizer):
             raise ValueError("Async Dion only supports power_iters=1")
         if qr_method != "rcqr":
             raise ValueError("Async Dion only supports qr_method='rcqr'")
+        scalar_backend = validate_scalar_backend(scalar_backend)
 
         # Check device mesh
         if replicate_mesh is not None:
@@ -185,6 +189,7 @@ class Dion(Optimizer):
             oversample=rcqr_oversample,
             algorithm="dion",
             step=0,
+            scalar_backend=scalar_backend,
         )
         super().__init__(params, defaults)
 
@@ -439,7 +444,8 @@ class Dion(Optimizer):
             momentums = [s["momentum"] for s in states]
             variances = [s["variance"] for s in states]
 
-            # Wrap hyperparameters in tensors for torch.compile
+            # Keep scalar hyperparameters as CPU tensors for the foreach fallback.
+            # The fused AdamW path will unwrap them back to Python scalars.
             lr = torch.tensor(group["lr"])
             beta1 = torch.tensor(group["beta1"])
             beta2 = torch.tensor(group["beta2"])
@@ -466,6 +472,7 @@ class Dion(Optimizer):
                     step=step,
                     epsilon=epsilon,
                     replicate_mesh=all_reduce_mesh,
+                    scalar_backend=group["scalar_backend"],
                 )
             )
 
@@ -1570,6 +1577,7 @@ def adamw_update_allreduce_grad(
     step: int,
     epsilon: float,
     replicate_mesh: Optional[DeviceMesh] = None,
+    scalar_backend: str = "auto",
 ) -> Generator[None, None, None]:
     """
     AdamW optimizer algorithm with gradient all-reduce.
@@ -1577,7 +1585,19 @@ def adamw_update_allreduce_grad(
     if replicate_mesh is not None:
         G = all_reduce_replicate_mesh(G, replicate_mesh, return_dtensor=False)
         yield
-    adamw_update_foreach(X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon)
+    adamw_update_auto(
+        X,
+        G,
+        M,
+        V,
+        lr,
+        beta1,
+        beta2,
+        weight_decay,
+        step,
+        epsilon,
+        scalar_backend=scalar_backend,
+    )
 
 
 def lion_update_allreduce_grad(

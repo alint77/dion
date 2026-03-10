@@ -16,7 +16,11 @@ from .opt_utils import (
     pad_batch,
     to_local,
 )
-from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
+from .scalar_opts import (
+    adamw_update_async,
+    lion_update_foreach_async,
+    validate_scalar_backend,
+)
 
 # Reuse Muon's helper functions
 from .muon import (
@@ -40,6 +44,7 @@ class Dion2(Optimizer):
         ef_decay: Error-feedback decay factor applied to selected submatrix.
         betas: Tuple of (beta1, beta2) for AdamW and Lion algorithms.
         weight_decay: Weight decay factor.
+        cautious_wd is not applied to AdamW scalar groups; they always use standard AdamW decay.
         epsilon: Small value to avoid division by zero.
         adjust_lr: How to adjust the learning rate for Muon updates ("spectral_norm" or "rms_norm" or None).
             "spectral_norm": Adjust based on spectral norm, for learning rate transfer across model scale.
@@ -52,6 +57,8 @@ class Dion2(Optimizer):
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is `func(input: Tensor, epsilon: float) -> Tensor`.
         verbose: Whether to print debug information during updates. If True, it prints whether rows or columns are selected for the submatrix selection process.
+        scalar_backend: Backend for AdamW scalar parameter groups.
+            "auto" prefers PyTorch's fused CUDA AdamW and falls back to Dion's foreach path.
 
     Dion2 optimizer by Ahn et al.: TBD
     """
@@ -71,6 +78,7 @@ class Dion2(Optimizer):
         use_triton: bool = False,
         newton_schulz_func: Optional[Callable] = None,
         verbose: bool = False,
+        scalar_backend: str = "auto",
     ):
         # Validate hyperparameters
         if lr < 0.0:
@@ -85,6 +93,7 @@ class Dion2(Optimizer):
             raise ValueError(
                 f"Invalid adjust_lr value: {adjust_lr}. Must be 'spectral_norm', 'rms_norm', or None."
             )
+        scalar_backend = validate_scalar_backend(scalar_backend)
 
         defaults = dict(
             lr=lr,
@@ -98,6 +107,7 @@ class Dion2(Optimizer):
             adjust_lr=adjust_lr,
             algorithm="dion2",
             step=0,
+            scalar_backend=scalar_backend,
         )
         super().__init__(params, defaults)
 
@@ -372,16 +382,15 @@ class Dion2(Optimizer):
             momentums = [s["momentum"] for s in states]
             variances = [s["variance"] for s in states]
 
-            # Wrap hyperparameters in tensors for torch.compile
+            # Keep scalar hyperparameters as CPU tensors for the foreach fallback.
+            # The fused AdamW path will unwrap them back to Python scalars.
             lr = torch.tensor(group["lr"])
             beta1 = torch.tensor(group["beta1"])
             beta2 = torch.tensor(group["beta2"])
             weight_decay = torch.tensor(group["weight_decay"])
-            epsilon = torch.tensor(group["epsilon"])
-            step = torch.tensor(group["step"])
 
             yield AsyncTask(
-                adamw_update_foreach_async(
+                adamw_update_async(
                     X=to_local(params),
                     G=to_local(gradients),
                     M=to_local(momentums),
@@ -390,8 +399,10 @@ class Dion2(Optimizer):
                     beta1=beta1,
                     beta2=beta2,
                     weight_decay=weight_decay,
-                    step=step,
-                    epsilon=epsilon,
+                    step=group["step"],
+                    epsilon=group["epsilon"],
+                    cautious_wd=False,
+                    scalar_backend=group["scalar_backend"],
                 )
             )
 
