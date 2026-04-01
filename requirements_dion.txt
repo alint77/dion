@@ -1,3 +1,3 @@
 numpy
 torch>=2.7.1
-gram-newton-schulz @ git+https://github.com/Dao-AILab/gram-newton-schulz.git@e52dc5a66468a78f910e34a4b48caa2964f3525c
+gram-newton-schulz @ git+https://github.com/Dao-AILab/gram-newton-schulz.git@compile-yes-overhead
