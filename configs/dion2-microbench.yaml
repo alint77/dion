@@ -1,6 +1,6 @@
 
 # — Model —
-model_dim: 16384
+model_dim: 2048
 n_layer: 4
 n_head: 16
 sequence_length: 1024
@@ -8,7 +8,7 @@ sequence_length: 1024
 # — Batching & Training —
 batch_size: 8
 device_batch_size: 2
-num_iterations: 40
+num_iterations: 100
 
 # — Learning‐rate schedule —
 warmup_ratio: 0.0
@@ -29,3 +29,6 @@ weight_decay: 0.01
 ortho_fraction: 1.0
 adjust_lr: spectral_norm
 lr: 0.02
+use_polar_express: true
+use_gram_newton_schulz: true
+time_optimizer: true
