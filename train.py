@@ -207,7 +207,10 @@ def parse_cli_args():
         "--use_polar_express", action="store_true", help="Use Polar Express for orthogonalization"
     )
     parser.add_argument(
-        "--use_gram_newton_schulz", action="store_true", help="Use Gram Newton-Schulz for orthogonalization"
+        "--use_gns_package", action="store_true", help="Use the gram-newton-schulz package for orthogonalization"
+    )
+    parser.add_argument(
+        "--use_gns_alg", action="store_true", help="Use the Gram Newton-Schulz algorithm (requires --use_gns_package)"
     )
 
     cli_args = parser.parse_args()
@@ -231,7 +234,8 @@ def parse_cli_args():
             "no_compile",
             "no_triton",
             "use_polar_express",
-            "use_gram_newton_schulz",
+            "use_gns_package",
+            "use_gns_alg",
             "debug",
         ):
             if yaml_cfg.get(flag, False):
@@ -437,7 +441,8 @@ def init_optimizer(
             weight_decay=hp.weight_decay,
             nesterov=True,
             adjust_lr=hp.adjust_lr,
-            use_gram_newton_schulz=cli_args.use_gram_newton_schulz,
+            use_gns_package=cli_args.use_gns_package,
+            use_gns_alg=cli_args.use_gns_alg,
             use_triton=(not cli_args.no_triton),
             use_polar_express=cli_args.use_polar_express,
         )
@@ -465,7 +470,8 @@ def init_optimizer(
             ef_decay=hp.mu,
             weight_decay=hp.weight_decay,
             adjust_lr=hp.adjust_lr,
-            use_gram_newton_schulz=cli_args.use_gram_newton_schulz,
+            use_gns_package=cli_args.use_gns_package,
+            use_gns_alg=cli_args.use_gns_alg,
             use_triton=(not cli_args.no_triton),
             use_polar_express=cli_args.use_polar_express,
             verbose=hp.verbose,
@@ -497,7 +503,8 @@ def init_optimizer(
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
             use_polar_express=cli_args.use_polar_express,
-            use_gram_newton_schulz=cli_args.use_gram_newton_schulz,
+            use_gns_package=cli_args.use_gns_package,
+            use_gns_alg=cli_args.use_gns_alg,
         )
 
     elif hp.optimizer == "dion_simple":

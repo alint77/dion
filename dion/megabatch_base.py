@@ -28,13 +28,22 @@ class DistributedOrthoBase(Optimizer):
     Subclasses must implement ``_create_ortho_tasks()``.
     """
 
+    # Native dion NS functions: (use_polar_express, use_triton) -> func
+    _NATIVE_NS_FUNCS = {
+        (True, True): polar_express_triton,
+        (True, False): polar_express,
+        (False, True): newton_schulz_triton,
+        (False, False): zeropower_via_newtonschulz5,
+    }
+
     def __init__(
         self,
         params: ParamsT,
         distributed_mesh: Optional[Union[DeviceMesh, ProcessGroup]],
         algo_name: str,
         defaults: dict,
-        use_gram_newton_schulz: bool = False,
+        use_gns_package: bool = False,
+        use_gns_alg: bool = False,
         use_triton: bool = False,
         use_polar_express: bool = True,
         newton_schulz_func: Optional[Callable] = None,
@@ -74,37 +83,31 @@ class DistributedOrthoBase(Optimizer):
                     f"newton_schulz_func must be a callable function, got {type(newton_schulz_func)}"
                 )
             self._newton_schulz_func = newton_schulz_func
-        elif use_gram_newton_schulz:
+        elif use_gns_package:
             try:
                 from gram_newton_schulz import GramNewtonSchulz
             except ImportError:
                 raise ImportError(
-                    "use_gram_newton_schulz=True requires the 'gram-newton-schulz' package, "
+                    "use_gns_package=True requires the 'gram-newton-schulz' package, "
                     "which is not installed. "
                     "Install it with: pip install gram-newton-schulz"
                 )
-            use_polar_express = True
             _gns = GramNewtonSchulz(
                 ns_use_kernels=use_triton,
-                use_gram_newton_schulz=True,
-                gram_newton_schulz_reset_iterations=[2],
-                # Some compiler crashes were observed with mode="reduce-overhead" when we also compile the entire optimizer step.
+                use_gram_newton_schulz=use_gns_alg,
+                gram_newton_schulz_reset_iterations=[2] if use_gns_alg else None,
                 compile_kwargs=dict(fullgraph=True, mode="default"),
             )
             self._newton_schulz_func = lambda X, epsilon=None: _gns(X)
-        elif use_polar_express and use_triton:
-            self._newton_schulz_func = polar_express_triton
-        elif use_polar_express:
-            self._newton_schulz_func = polar_express
-        elif use_triton:
-            if not TRITON_AVAILABLE:
+        else:
+            if use_triton and not TRITON_AVAILABLE:
                 raise ImportError(
                     "use_triton=True requires the 'triton' package, which is not installed. "
                     "Install it with: pip install dion[triton]  (or: pip install triton)"
                 )
-            self._newton_schulz_func = newton_schulz_triton
-        else:
-            self._newton_schulz_func = zeropower_via_newtonschulz5
+            self._newton_schulz_func = self._NATIVE_NS_FUNCS[
+                (use_polar_express, use_triton)
+            ]
 
     @torch.no_grad()
     def step(self, closure=None):
