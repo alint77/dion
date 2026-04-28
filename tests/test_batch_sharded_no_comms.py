@@ -8,8 +8,19 @@ Both tests are run in two modes:
   a) Manual DTensor construction
   b) FSDP2 fully_shard() on a real module
 
-Run with:
+Run tests:
     torchrun --standalone --nproc_per_node=4 tests/test_batch_sharded_no_comms.py
+
+Profile with nsys (captures NCCL comms + NVTX markers):
+    nsys profile --trace=cuda,nvtx --output=/tmp/nsys_batch_sharded --force-overwrite=true torchrun --standalone --nproc_per_node=4 tests/test_batch_sharded_no_comms.py
+
+View summary stats:
+    nsys stats /tmp/nsys_batch_sharded.nsys-rep --report cuda_gpu_kern_sum
+    nsys stats /tmp/nsys_batch_sharded.nsys-rep --report nvtx_pushpop_sum
+
+Copy report to a local machine and open in Nsight Systems GUI:
+    scp <remote-host>:/tmp/nsys_batch_sharded.nsys-rep .
+    nsys-ui nsys_batch_sharded.nsys-rep
 """
 
 import sys
@@ -89,7 +100,10 @@ def run_manual_tests(rank, mesh, device, optimizers_to_test, original_all_to_all
         with mock.patch.object(dist, "all_to_all", side_effect=fail_all_to_all), \
              mock.patch.object(dist, "all_gather", side_effect=fail_all_gather):
             try:
+                torch.cuda.nvtx.range_push(f"{name}_manual_3D_step")
                 optimizer.step()
+                torch.cuda.synchronize()
+                torch.cuda.nvtx.range_pop()
                 if rank == 0:
                     print(f"  PASS: {name} — no communication")
             except AssertionError as e:
@@ -131,7 +145,10 @@ def run_manual_tests(rank, mesh, device, optimizers_to_test, original_all_to_all
 
         with mock.patch.object(dist, "all_to_all", side_effect=tracking_all_to_all), \
              mock.patch.object(dist, "all_gather", side_effect=tracking_all_gather):
+            torch.cuda.nvtx.range_push(f"{name}_manual_2D_step")
             optimizer.step()
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
 
         if comm_called:
             if rank == 0:
@@ -145,12 +162,17 @@ def run_manual_tests(rank, mesh, device, optimizers_to_test, original_all_to_all
 
 
 def run_fsdp_tests(rank, mesh, device, optimizers_to_test, original_all_to_all, original_all_gather):
-    """Test 2: FSDP2 fully_shard() on a real module."""
+    """Test 2: FSDP2 fully_shard() on a real module.
+
+    Uses a single optimizer with both 3D and 2D params. NVTX markers on each
+    all_to_all / all_gather call record the tensor ndim, so in nsys you can
+    see which NCCL ops are for 2D params (ndim=3 after stack) vs 3D params
+    (ndim=4 after stack — should not appear).
+    """
     if rank == 0:
         print("\n--- Test 2: FSDP2 fully_shard() module ---")
 
     for name, opt_cls, opt_kwargs in optimizers_to_test:
-        # Create model on meta device, apply FSDP, then materialize
         model = ToyModel()
         model.to(device)
 
@@ -173,28 +195,33 @@ def run_fsdp_tests(rank, mesh, device, optimizers_to_test, original_all_to_all, 
         # Single optimizer with all params
         optimizer = opt_cls(list(model.parameters()), distributed_mesh=mesh, **opt_kwargs)
 
-        # Track the ndim of tensors involved in communication.
-        # In the all_to_all path, input_tensor_list items have an extra stacked dim,
-        # so a 2D param becomes 3D after stack, and a 3D param becomes 4D.
-        # We record the ndim of the communicated chunks.
         comm_ndims = set()
 
-        def tracking_all_to_all(*args, _orig=original_all_to_all, **kwargs):
-            # args: (output_tensor_list, input_tensor_list, ...)
+        def tracking_all_to_all(*args, _orig=original_all_to_all, _name=name, **kwargs):
+            ndim = args[1][0].ndim if len(args) >= 2 and args[1] else None
+            torch.cuda.nvtx.range_push(f"{_name}_all_to_all_ndim={ndim}")
+            result = _orig(*args, **kwargs)
+            torch.cuda.nvtx.range_pop()
             if len(args) >= 2:
                 for t in args[1]:
                     comm_ndims.add(t.ndim)
-            return _orig(*args, **kwargs)
+            return result
 
-        def tracking_all_gather(*args, _orig=original_all_gather, **kwargs):
-            # args: (output_tensor_list, input_tensor, ...)
+        def tracking_all_gather(*args, _orig=original_all_gather, _name=name, **kwargs):
+            ndim = args[1].ndim if len(args) >= 2 else None
+            torch.cuda.nvtx.range_push(f"{_name}_all_gather_ndim={ndim}")
+            result = _orig(*args, **kwargs)
+            torch.cuda.nvtx.range_pop()
             if len(args) >= 2:
                 comm_ndims.add(args[1].ndim)
-            return _orig(*args, **kwargs)
+            return result
 
         with mock.patch.object(dist, "all_to_all", side_effect=tracking_all_to_all), \
              mock.patch.object(dist, "all_gather", side_effect=tracking_all_gather):
+            torch.cuda.nvtx.range_push(f"{name}_optimizer_step")
             optimizer.step()
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
 
         # 2D params (stacked → 3D in comm) should have communicated
         if 3 not in comm_ndims:
@@ -208,7 +235,7 @@ def run_fsdp_tests(rank, mesh, device, optimizers_to_test, original_all_to_all, 
             return False
 
         if rank == 0:
-            print(f"    PASS: 2D params communicated, 3D params did not (comm ndims: {comm_ndims})")
+            print(f"    PASS: only 2D params communicated (comm ndims: {comm_ndims})")
 
     return True
 
@@ -230,9 +257,9 @@ def main():
     original_all_gather = dist.all_gather
 
     optimizers_to_test = [
-        ("Muon", Muon, dict(lr=0.01, flatten=False)),
-        ("Dion2", Dion2, dict(lr=0.01, flatten=False)),
-        ("NorMuon", NorMuon, dict(lr=0.01, flatten=False)),
+        ("Muon", Muon, dict(lr=0.01, flatten=False, use_gram_newton_schulz=True)),
+        ("Dion2", Dion2, dict(lr=0.01, flatten=False, use_gram_newton_schulz=True)),
+        ("NorMuon", NorMuon, dict(lr=0.01, flatten=False, use_gram_newton_schulz=True)),
     ]
 
     ok = run_manual_tests(rank, mesh, device, optimizers_to_test, original_all_to_all, original_all_gather)
