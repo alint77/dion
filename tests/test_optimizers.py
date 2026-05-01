@@ -94,6 +94,72 @@ class TestMuon:
 
 
 # ---------------------------------------------------------------------------
+# MuonH
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
+class TestMuonH:
+    def test_basic(self):
+        from dion import MuonH
+        params = _make_params([(64, 128), (128, 64)])
+        _run_steps(MuonH, params, dict(lr=0.01))
+
+    @pytest.mark.parametrize("normalization", [None, "None", "neuron", "short_axis"])
+    def test_normalization_options(self, normalization):
+        from dion import MuonH
+        params = _make_params([(64, 128), (128, 64)])
+        _run_steps(MuonH, params, dict(lr=0.01, normalization=normalization))
+
+    @pytest.mark.parametrize("normalization", [None, "neuron", "short_axis"])
+    def test_preserves_frobenius_norm(self, normalization):
+        from dion import MuonH
+        params = _make_params([(64, 128), (128, 64)])
+        before = [p.data.float().norm() for p in params]
+        _run_steps(
+            MuonH,
+            params,
+            dict(lr=0.01, normalization=normalization),
+            n_steps=2,
+        )
+        after = [p.data.float().norm() for p in params]
+        for a, b in zip(after, before):
+            torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-5)
+
+    def test_variance_shapes(self):
+        from dion import MuonH
+        wide = torch.nn.Parameter(torch.randn(64, 128, device=DEVICE))
+        tall = torch.nn.Parameter(torch.randn(128, 64, device=DEVICE))
+
+        opt = MuonH([wide], lr=0.01, normalization="neuron")
+        wide.grad = torch.randn_like(wide)
+        opt.step()
+        assert opt.state[wide]["variance_normalization"].shape == (64, 1)
+
+        opt = MuonH([wide], lr=0.01, normalization="short_axis")
+        wide.grad = torch.randn_like(wide)
+        opt.step()
+        assert opt.state[wide]["variance_normalization"].shape == (1, 128)
+
+        opt = MuonH([tall], lr=0.01, normalization="short_axis")
+        tall.grad = torch.randn_like(tall)
+        opt.step()
+        assert opt.state[tall]["variance_normalization"].shape == (128, 1)
+
+    def test_zero_radius_rejected(self):
+        from dion import MuonH
+        param = torch.nn.Parameter(torch.zeros(64, 128, device=DEVICE))
+        param.grad = torch.randn_like(param)
+        opt = MuonH([param], lr=0.01)
+        with pytest.raises(ValueError, match="non-zero"):
+            opt.step()
+
+    def test_invalid_normalization(self):
+        from dion import MuonH
+        with pytest.raises(ValueError):
+            MuonH(_make_params([(32, 64)]), normalization="invalid")
+
+
+# ---------------------------------------------------------------------------
 # NorMuon
 # ---------------------------------------------------------------------------
 
