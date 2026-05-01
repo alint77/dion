@@ -3,6 +3,7 @@
 model_dim: 768
 n_layer: 12
 n_head: 6
+use_bias: false
 sequence_length: 1024
 
 # — Batching & Training —

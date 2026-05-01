@@ -48,6 +48,7 @@ class Hyperparameters:
     model_dim: int = 768
     n_layer: int = 12
     n_head: int = 6
+    use_bias: bool = False
 
     # Evaluation and logging
     val_loss_every: int = 125
@@ -73,6 +74,7 @@ class Hyperparameters:
     replicate_mesh_grad_sync: bool = False
     mixed_precision: bool = False
     adjust_lr: str = "spectral_norm"  # for Muon only
+    split_heads: bool = False
 
     # For printing out selection choice in Dion2
     verbose: bool = True
@@ -326,21 +328,40 @@ def init_optimizer(
         raise ValueError(f"Unrecognized scalar optimizer: {hp.scalar_opt}")
 
     # Separate the model's parameters based on their types
-    matrix_params = list(model.transformer.h.parameters())
-    embedding_params = list(model.transformer.wte.parameters())
-    lm_head_params = list(model.lm_head.parameters())
+    qkv_params = []
+    other_matrix_params = []
+    array_and_embedding_params = []
+    lm_head_params = []
+    qkv_names = {"c_q.weight", "c_k.weight", "c_v.weight"}
+    for name, p in model.named_parameters():
+        if name.startswith("lm_head."):
+            lm_head_params.append(p)
+        elif any(q in name for q in qkv_names):
+            qkv_params.append(p)
+        elif "wte" in name:
+            array_and_embedding_params.append(p)
+        elif (p.ndim >= 2) and ("wte" not in name):
+            other_matrix_params.append(p)
+        else:
+            array_and_embedding_params.append(p)
 
     # Matrix params use optimizer default settings
-    param_groups = [dict(params=matrix_params)]
+    param_groups = [dict(params=other_matrix_params)]
 
-    # Add additional param groups with the necessary configurations for scalar params
+    # QKV projections: full orthogonalization, no LR adjustment
+    qkv_group = dict(params=qkv_params, fraction=1.0, adjust_lr=None)
+    if hp.split_heads:
+        qkv_group["num_heads"] = hp.n_head
+    param_groups.append(qkv_group)
+
+    # Catch-all for everything that shouldn't be orthogonalized (biases, norms, embeddings)
     param_groups.append(
         dict(
-            params=embedding_params,
+            params=array_and_embedding_params,
             algorithm=hp.scalar_opt,
-            lr=hp.lr,  # no LR adjustment for embedding parameters
+            lr=hp.lr,  # no LR adjustment for biases or embedding parameters
             betas=(0.95, 0.98),
-            weight_decay=0,  # no weight decay for embedding parameters
+            weight_decay=0,  # no weight decay for biases or embedding parameters
         )
     )
     param_groups.append(
@@ -756,6 +777,7 @@ def main():
         n_layer=hp.n_layer,
         n_head=hp.n_head,
         n_embd=hp.model_dim,
+        use_bias=hp.use_bias,
     )
     with torch.device("meta"):
         model = GPT(gpt_config)

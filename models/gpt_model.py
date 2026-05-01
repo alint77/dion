@@ -21,6 +21,7 @@ class GPTConfig:
     n_layer: int = 2
     n_head: int = 6
     n_embd: int = 768
+    use_bias: bool = False
 
 
 class Rotary(torch.nn.Module):
@@ -68,11 +69,11 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=config.use_bias)
+        self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=config.use_bias)
+        self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=config.use_bias)
         # output projection
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=config.use_bias)
         self.rotary = Rotary(self.head_dim)
 
     def forward(self, x):
@@ -100,8 +101,8 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.use_bias)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.use_bias)
 
     def forward(self, x):
         x = self.c_fc(x)
