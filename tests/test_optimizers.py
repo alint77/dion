@@ -196,6 +196,47 @@ class TestNorMuon:
         assert "variance_neuron" in state
         assert state["variance_neuron"].shape == (64, 1)
 
+    @pytest.mark.parametrize("normalization", ["neuron", "short_axis"])
+    def test_normalization_options(self, normalization):
+        from dion import NorMuon
+        params = _make_params([(64, 128), (128, 64)])
+        _run_steps(NorMuon, params, dict(lr=0.01, normalization=normalization))
+
+    def test_variance_shapes(self):
+        from dion import NorMuon
+        wide = torch.nn.Parameter(torch.randn(64, 128, device=DEVICE))
+        tall = torch.nn.Parameter(torch.randn(128, 64, device=DEVICE))
+
+        opt = NorMuon([wide], lr=0.01, normalization="neuron")
+        wide.grad = torch.randn_like(wide)
+        opt.step()
+        assert opt.state[wide]["variance_neuron"].shape == (64, 1)
+
+        opt = NorMuon([wide], lr=0.01, normalization="short_axis")
+        wide.grad = torch.randn_like(wide)
+        opt.step()
+        assert opt.state[wide]["variance_neuron"].shape == (1, 128)
+
+        opt = NorMuon([tall], lr=0.01, normalization="short_axis")
+        tall.grad = torch.randn_like(tall)
+        opt.step()
+        assert opt.state[tall]["variance_neuron"].shape == (128, 1)
+
+    def test_short_axis_matches_neuron_for_tall(self):
+        """For tall matrices the reduction axis is the same, so short_axis
+        must produce numerically identical updates to neuron."""
+        from dion import NorMuon
+        p1 = _make_params([(128, 64)])
+        r1 = _run_steps(NorMuon, p1, dict(lr=0.01, normalization="neuron"))
+        p2 = _make_params([(128, 64)])
+        r2 = _run_steps(NorMuon, p2, dict(lr=0.01, normalization="short_axis"))
+        torch.testing.assert_close(r1[0], r2[0], rtol=1e-5, atol=1e-5)
+
+    def test_invalid_normalization(self):
+        from dion import NorMuon
+        with pytest.raises(ValueError):
+            NorMuon(_make_params([(32, 64)]), normalization="invalid")
+
     def test_megabatch_same_shape(self):
         from dion import NorMuon
         params = _make_params([(64, 128)] * 5)
