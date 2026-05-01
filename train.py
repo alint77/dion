@@ -45,6 +45,7 @@ class Hyperparameters:
     warmdown_ratio: float = 0.2
 
     # Model config
+    vocab_size: int = 50304  # nearest multiple of 128 for efficiency
     model_dim: int = 768
     n_layer: int = 12
     n_head: int = 6
@@ -148,6 +149,7 @@ def parse_cli_args():
     )
 
     # ---------- model ----------
+    parser.add_argument("--vocab_size", type=int, default=None)
     parser.add_argument("--model_dim", type=int, default=None)
     parser.add_argument("--n_layer", type=int, default=None)
     parser.add_argument("--n_head", type=int, default=None)
@@ -770,10 +772,9 @@ def main():
     print0(f"Number of layers: {hp.n_layer}")
     print0(f"Number of heads: {hp.n_head}")
 
-    num_vocab = 50304  # nearest multiple of 128 for efficiency
     gpt_config = GPTConfig(
         sequence_len=hp.sequence_length,
-        vocab_size=num_vocab,
+        vocab_size=hp.vocab_size,
         n_layer=hp.n_layer,
         n_head=hp.n_head,
         n_embd=hp.model_dim,

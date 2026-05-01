@@ -3,6 +3,7 @@
 model_dim: 2048
 n_layer: 4
 n_head: 16
+use_bias: false
 sequence_length: 1024
 
 # — Batching & Training —
@@ -31,4 +32,5 @@ adjust_lr: spectral_norm
 lr: 0.02
 use_polar_express: true
 use_gram_newton_schulz: true
+split_heads: false
 time_optimizer: true
