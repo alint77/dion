@@ -352,6 +352,30 @@ def muonh_update_megabatch_async(
     )
 
 
+@torch.compile(fullgraph=True, dynamic=False)
+def _muonh_sum_sq_compiled(U_stacked: Tensor, red_dim: int) -> Tensor:
+    return U_stacked.float().square().sum(dim=red_dim, keepdim=True)
+
+
+@torch.compile(fullgraph=True, dynamic=False)
+def _muonh_normalize_finish_compiled(
+    U_stacked: Tensor,
+    V_stacked: Tensor,
+    sum_sq: Tensor,
+    red_dim_size: int,
+    muon_beta2: Tensor,
+    epsilon: float,
+) -> Tuple[Tensor, Tensor]:
+    V_dtype = V_stacked.dtype
+    variance_new = (sum_sq / red_dim_size).to(dtype=V_dtype)
+    norm_U = U_stacked.float().norm(p=2, dim=(-2, -1), keepdim=True)
+    V_stacked = torch.lerp(V_stacked, variance_new, 1 - muon_beta2)
+    normalized_U = U_stacked.float() / (V_stacked.float().sqrt() + epsilon)
+    norm_U_new = normalized_U.norm(p=2, dim=(-2, -1), keepdim=True).clamp(min=epsilon)
+    normalized_U = (normalized_U * (norm_U / norm_U_new)).to(dtype=V_dtype)
+    return normalized_U, V_stacked
+
+
 def muonh_normalization_async(
     U: List[Tensor],
     V: List[Tensor],
@@ -362,7 +386,11 @@ def muonh_normalization_async(
     process_group: Optional[ProcessGroup],
     epsilon: Tensor,
 ) -> Generator[None, None, List[Tensor]]:
-    """Optional MuonH update normalization, with reductions when the normalized axis is sharded."""
+    """Optional MuonH update normalization, with reductions when the normalized axis is sharded.
+
+    Pure-tensor pre-/post-comm sections are compiled; the async dist.all_reduce
+    sits in between and stays in eager Python.
+    """
     U_stacked = torch.stack(U)
     V_stacked = torch.stack(V)
 
@@ -370,7 +398,7 @@ def muonh_normalization_async(
     if normalization == "short_axis" and param_shape[-2] < param_shape[-1]:
         red_dim = -2
 
-    sum_sq = U_stacked.float().square().sum(dim=red_dim, keepdim=True)
+    sum_sq = _muonh_sum_sq_compiled(U_stacked, red_dim)
     shard_dim_neg = None
     if shard_dim is not None:
         shard_dim_neg = shard_dim if shard_dim < 0 else shard_dim - len(param_shape)
@@ -379,21 +407,53 @@ def muonh_normalization_async(
         yield
         work.wait()
 
-    red_dim_size = param_shape[red_dim]
-    variance_new = sum_sq / red_dim_size
-    norm_U = U_stacked.float().norm(p=2, dim=(-2, -1), keepdim=True)
+    normalized_U, V_stacked = _muonh_normalize_finish_compiled(
+        U_stacked, V_stacked, sum_sq, param_shape[red_dim], muon_beta2, float(epsilon),
+    )
 
-    V_dtype = V_stacked.dtype
-    V_stacked = torch.lerp(V_stacked, variance_new.to(dtype=V_dtype), 1 - muon_beta2)
+    torch._foreach_copy_(list(V), list(V_stacked.unbind(0)))
+    return list(normalized_U.unbind(0))
 
-    normalized_U = U_stacked.float() / (V_stacked.float().sqrt() + float(epsilon))
-    norm_U_new = normalized_U.norm(p=2, dim=(-2, -1), keepdim=True).clamp(min=float(epsilon))
-    normalized_U = normalized_U * (norm_U / norm_U_new)
-    normalized_U = normalized_U.to(dtype=V_dtype)
 
-    for i in range(len(V)):
-        V[i].copy_(V_stacked[i])
-    return [normalized_U[i] for i in range(len(U))]
+@torch.compile(fullgraph=True, dynamic=False)
+def _muonh_sq_sum_flat_compiled(stacked: Tensor) -> Tensor:
+    return stacked.float().square().flatten(1).sum(dim=-1)
+
+
+@torch.compile(fullgraph=True, dynamic=False)
+def _muonh_step_compiled(
+    X_stacked: Tensor,
+    U_stacked: Tensor,
+    update_sq_sums: Tensor,
+    radii: Tensor,
+    adjusted_lr: Tensor,
+    eps: float,
+) -> Tuple[Tensor, Tensor]:
+    x_dtype = X_stacked.dtype
+    extra = X_stacked.ndim - 1
+    update_norms = update_sq_sums.sqrt()
+    scales = (adjusted_lr * radii / update_norms.clamp_min(eps)).to(dtype=x_dtype)
+    for _ in range(extra):
+        scales = scales.unsqueeze(-1)
+    candidate_stacked = X_stacked - U_stacked * scales
+    candidate_sq_sums = candidate_stacked.float().square().flatten(1).sum(dim=-1)
+    return candidate_stacked, candidate_sq_sums
+
+
+@torch.compile(fullgraph=True, dynamic=False)
+def _muonh_project_compiled(
+    candidate_stacked: Tensor,
+    candidate_sq_sums: Tensor,
+    radii: Tensor,
+    eps: float,
+) -> Tensor:
+    x_dtype = candidate_stacked.dtype
+    extra = candidate_stacked.ndim - 1
+    candidate_norms = candidate_sq_sums.sqrt()
+    scales = (radii / candidate_norms.clamp_min(eps)).to(dtype=x_dtype)
+    for _ in range(extra):
+        scales = scales.unsqueeze(-1)
+    return candidate_stacked * scales
 
 
 def muonh_update_post_orthogonalize_async(
@@ -404,27 +464,42 @@ def muonh_update_post_orthogonalize_async(
     epsilon: Tensor,
     process_group: Optional[ProcessGroup],
 ) -> Generator[None, None, None]:
-    """Apply a scale-invariant hyperball step and project back to stored radii."""
-    device = X[0].device
+    """Apply a scale-invariant hyperball step and project back to stored radii.
+
+    Pure-tensor sections are compiled and split around the optional async
+    all-reduces of the update / candidate Frobenius norms.
+    """
     eps = float(epsilon)
-    radii = torch.stack([r.to(device=device, dtype=torch.float32) for r in R])
-    lr = adjusted_lr.to(device=device, dtype=torch.float32)
+    radii = torch.stack(list(R))
+    x_dtype = X[0].dtype
 
-    update_norms = yield from _fro_norms_async(U, process_group)
-    step_scales = lr * radii / update_norms.clamp_min(eps)
-    candidates = [
-        x - u.to(dtype=x.dtype) * step_scales[i].to(device=x.device, dtype=x.dtype)
-        for i, (x, u) in enumerate(zip(X, U))
-    ]
+    U_stacked = torch.stack(U).to(dtype=x_dtype)
+    X_stacked = torch.stack(list(X))
 
-    candidate_norms = yield from _fro_norms_async(candidates, process_group)
-    project_scales = radii / candidate_norms.clamp_min(eps)
-    for i, (x, candidate) in enumerate(zip(X, candidates)):
-        x.copy_(candidate * project_scales[i].to(device=x.device, dtype=candidate.dtype))
+    update_sq_sums = _muonh_sq_sum_flat_compiled(U_stacked)
+    if process_group is not None:
+        work = dist.all_reduce(update_sq_sums, group=process_group, async_op=True)
+        yield
+        work.wait()
+
+    candidate_stacked, candidate_sq_sums = _muonh_step_compiled(
+        X_stacked, U_stacked, update_sq_sums, radii, adjusted_lr, eps,
+    )
+    if process_group is not None:
+        work = dist.all_reduce(candidate_sq_sums, group=process_group, async_op=True)
+        yield
+        work.wait()
+
+    final_stacked = _muonh_project_compiled(
+        candidate_stacked, candidate_sq_sums, radii, eps,
+    )
+    torch._foreach_copy_(list(X), list(final_stacked.unbind(0)))
 
 
 def _local_square_sums(tensors: List[Tensor]) -> Tensor:
-    return torch.stack([t.float().square().sum() for t in tensors])
+    """Per-tensor sum of squares, fused via a single stack + flatten + sum."""
+    stacked = torch.stack(tensors).float()
+    return stacked.square().flatten(1).sum(dim=-1) if stacked.ndim > 1 else stacked.square()
 
 
 def _fro_norms_async(
