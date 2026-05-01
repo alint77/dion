@@ -9,6 +9,7 @@ from typing import Callable, Generator, List, Optional, Tuple, Union
 
 from .megabatch_base import (
     DistributedOrthoBase,
+    canonical_normalization,
     megabatch_orthogonalize_async,
     adjust_lr_spectral_norm,
     adjust_lr_rms_norm,
@@ -18,13 +19,7 @@ from .muon import muon_update_pre_orthogonalize, muon_update_post_orthogonalize
 
 
 def _canonical_normalization(normalization: str) -> str:
-    if isinstance(normalization, str):
-        value = normalization.lower()
-        if value in ("neuron", "short_axis"):
-            return value
-    raise ValueError(
-        f"Invalid normalization: {normalization}. Must be 'neuron' or 'short_axis'."
-    )
+    return canonical_normalization(normalization, allow_none=False)
 
 
 class NorMuon(DistributedOrthoBase):
@@ -131,6 +126,16 @@ class NorMuon(DistributedOrthoBase):
     def _get_or_initialize_variance(
         self, param: Tensor, state: dict, normalization: str
     ) -> Tensor:
+        """Lazily allocate the per-param variance EMA buffer.
+
+        Note on resume / mode switch: the buffer is keyed by shape, so loading
+        a checkpoint and then changing the ``normalization`` mode (e.g.
+        ``neuron`` -> ``short_axis`` for a wide matrix) silently re-initializes
+        the EMA to zero. This is intentional: the saved variance is no longer
+        meaningful under the new mode, and a hard error would force the user
+        to manually clear state. The trade-off is a brief warm-up period where
+        the EMA is rebuilding from the new reduction axis.
+        """
         local = to_local(param)
         shape = list(local.shape)
         if normalization == "neuron":
@@ -328,6 +333,31 @@ def normuon_update_megabatch_async(
     )
 
 
+@torch.compile(fullgraph=True)
+def _normuon_short_axis_sum_sq_compiled(U: Tensor, red_dim: int) -> Tensor:
+    return U.float().square().sum(dim=red_dim, keepdim=True)
+
+
+@torch.compile(fullgraph=True)
+def _normuon_short_axis_finish_compiled(
+    U: Tensor,
+    V: Tensor,
+    sum_sq: Tensor,
+    red_dim_size: int,
+    muon_beta2: Tensor,
+) -> Tuple[Tensor, Tensor]:
+    V_dtype = V.dtype
+    U_v = U.to(dtype=V_dtype)
+    norm_U = U_v.norm(p=2, dim=(-2, -1), keepdim=True)
+    variance_new = (sum_sq / red_dim_size).to(dtype=V_dtype)
+    V = torch.lerp(V, variance_new, 1 - muon_beta2)
+    denom = V.sqrt() + 1e-8
+    normalized_U = U_v / denom
+    norm_U_new = normalized_U.norm(p=2, dim=(-2, -1), keepdim=True).clamp(min=1e-8)
+    normalized_U = normalized_U * (norm_U / norm_U_new)
+    return normalized_U, V
+
+
 def normuon_short_axis_normalization_async(
     U: Tensor,  # [N, rows, cols]
     V: Tensor,  # [N, ..., 1]   (variance buffer, with 1 along the long axis)
@@ -342,12 +372,15 @@ def normuon_short_axis_normalization_async(
     'neuron' for tall matrices; for wide matrices it reduces along rows
     instead of columns. An async all-reduce is issued when the reduced axis
     is sharded.
+
+    Pure-tensor pre-/post-comm sections are compiled; the async dist.all_reduce
+    sits in between and stays in eager Python.
     """
     red_dim = -1
     if param_shape[-2] < param_shape[-1]:
         red_dim = -2
 
-    sum_sq = U.float().square().sum(dim=red_dim, keepdim=True)
+    sum_sq = _normuon_short_axis_sum_sq_compiled(U, red_dim)
     shard_dim_neg = None
     if shard_dim is not None:
         shard_dim_neg = shard_dim if shard_dim < 0 else shard_dim - len(param_shape)
@@ -356,16 +389,9 @@ def normuon_short_axis_normalization_async(
         yield
         work.wait()
 
-    red_dim_size = param_shape[red_dim]
-    V_dtype = V.dtype
-    U_v = U.to(dtype=V_dtype)
-    norm_U = U_v.norm(p=2, dim=(-2, -1), keepdim=True)
-    variance_new = (sum_sq / red_dim_size).to(dtype=V_dtype)
-    V = torch.lerp(V, variance_new, 1 - muon_beta2)
-    denom = V.sqrt() + 1e-8
-    normalized_U = U_v / denom
-    norm_U_new = normalized_U.norm(p=2, dim=(-2, -1), keepdim=True).clamp(min=1e-8)
-    normalized_U = normalized_U * (norm_U / norm_U_new)
+    normalized_U, V = _normuon_short_axis_finish_compiled(
+        U, V, sum_sq, param_shape[red_dim], muon_beta2,
+    )
     return normalized_U, V
 
 

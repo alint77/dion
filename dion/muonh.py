@@ -9,6 +9,7 @@ from typing import Callable, Generator, List, Optional, Tuple, Union
 
 from .megabatch_base import (
     DistributedOrthoBase,
+    canonical_normalization,
     megabatch_orthogonalize_async,
     adjust_lr_spectral_norm,
     adjust_lr_rms_norm,
@@ -18,18 +19,7 @@ from .muon import muon_update_pre_orthogonalize
 
 
 def _canonical_normalization(normalization: Optional[str]) -> Optional[str]:
-    if normalization is None:
-        return None
-    if isinstance(normalization, str):
-        value = normalization.lower()
-        if value == "none":
-            return None
-        if value in ("neuron", "short_axis"):
-            return value
-    raise ValueError(
-        f"Invalid normalization: {normalization}. "
-        "Must be None, 'None', 'neuron', or 'short_axis'."
-    )
+    return canonical_normalization(normalization, allow_none=True)
 
 
 class MuonH(DistributedOrthoBase):
@@ -39,6 +29,13 @@ class MuonH(DistributedOrthoBase):
     MuonH uses Muon's momentum + orthogonalization direction, then applies a
     hyperball update: the step is scaled relative to each parameter's Frobenius
     norm, and the parameter is projected back to its initial Frobenius norm.
+
+    .. note::
+        Matrix parameters MUST be non-zero at optimizer construction. The
+        hyperball radius is initialized from the parameter's Frobenius norm on
+        the first step, so a zero-initialized parameter (common for output
+        projections under standard Muon practice) will raise ``ValueError``.
+        Use a non-zero init (e.g. Kaiming) for any layer assigned to MuonH.
 
     Args:
         params: Parameters for the optimizer.
@@ -134,7 +131,12 @@ class MuonH(DistributedOrthoBase):
             state["hyperball_radius"] = torch.zeros(
                 (), device=local.device, dtype=torch.float32
             )
-            state["hyperball_radius_initialized"] = False
+            # Stored as a CPU tensor (not a Python bool) so it survives
+            # state-dict round-trips through tensor-only checkpointing
+            # libraries. CPU avoids a device sync on the steady-state check.
+            state["hyperball_radius_initialized"] = torch.zeros(
+                (), dtype=torch.bool
+            )
         return state
 
     def _get_or_initialize_variance(
@@ -186,7 +188,7 @@ class MuonH(DistributedOrthoBase):
         for state, radius in zip(states, radii):
             if not state["hyperball_radius_initialized"]:
                 state["hyperball_radius"].copy_(radius)
-                state["hyperball_radius_initialized"] = True
+                state["hyperball_radius_initialized"].fill_(True)
 
     def _create_ortho_tasks(
         self, param_groups: List[dict]
@@ -352,12 +354,12 @@ def muonh_update_megabatch_async(
     )
 
 
-@torch.compile(fullgraph=True, dynamic=False)
+@torch.compile(fullgraph=True)
 def _muonh_sum_sq_compiled(U_stacked: Tensor, red_dim: int) -> Tensor:
     return U_stacked.float().square().sum(dim=red_dim, keepdim=True)
 
 
-@torch.compile(fullgraph=True, dynamic=False)
+@torch.compile(fullgraph=True)
 def _muonh_normalize_finish_compiled(
     U_stacked: Tensor,
     V_stacked: Tensor,
@@ -415,45 +417,54 @@ def muonh_normalization_async(
     return list(normalized_U.unbind(0))
 
 
-@torch.compile(fullgraph=True, dynamic=False)
-def _muonh_sq_sum_flat_compiled(stacked: Tensor) -> Tensor:
-    return stacked.float().square().flatten(1).sum(dim=-1)
+@torch.compile(fullgraph=True)
+def _muonh_local_sums_compiled(X_stacked: Tensor, U_stacked: Tensor) -> Tensor:
+    """Per-matrix local |U|^2, |X|^2, <X, U>, packed into a single [3, N] fp32 tensor.
+
+    Packing into one tensor lets the caller fuse the three reductions into a
+    single async all-reduce instead of issuing one round per quantity.
+    """
+    X_f = X_stacked.float()
+    U_f = U_stacked.float()
+    u_sq = U_f.square().flatten(1).sum(dim=-1)
+    x_sq = X_f.square().flatten(1).sum(dim=-1)
+    xu = (X_f * U_f).flatten(1).sum(dim=-1)
+    return torch.stack([u_sq, x_sq, xu], dim=0)
 
 
-@torch.compile(fullgraph=True, dynamic=False)
-def _muonh_step_compiled(
+@torch.compile(fullgraph=True)
+def _muonh_apply_step_compiled(
     X_stacked: Tensor,
     U_stacked: Tensor,
-    update_sq_sums: Tensor,
+    sums: Tensor,  # [3, N]: [|U|^2, |X|^2, <X, U>]
     radii: Tensor,
     adjusted_lr: Tensor,
     eps: float,
-) -> Tuple[Tensor, Tensor]:
-    x_dtype = X_stacked.dtype
-    extra = X_stacked.ndim - 1
-    update_norms = update_sq_sums.sqrt()
-    scales = (adjusted_lr * radii / update_norms.clamp_min(eps)).to(dtype=x_dtype)
-    for _ in range(extra):
-        scales = scales.unsqueeze(-1)
-    candidate_stacked = X_stacked - U_stacked * scales
-    candidate_sq_sums = candidate_stacked.float().square().flatten(1).sum(dim=-1)
-    return candidate_stacked, candidate_sq_sums
-
-
-@torch.compile(fullgraph=True, dynamic=False)
-def _muonh_project_compiled(
-    candidate_stacked: Tensor,
-    candidate_sq_sums: Tensor,
-    radii: Tensor,
-    eps: float,
 ) -> Tensor:
-    x_dtype = candidate_stacked.dtype
-    extra = candidate_stacked.ndim - 1
-    candidate_norms = candidate_sq_sums.sqrt()
-    scales = (radii / candidate_norms.clamp_min(eps)).to(dtype=x_dtype)
+    """Apply hyperball step + Frobenius-sphere projection in one fused multiply-subtract.
+
+    Uses the closed form |X - s*U|^2 = |X|^2 - 2*s*<X,U> + s^2*|U|^2 to skip
+    materializing the intermediate candidate tensor and a second reduction.
+    """
+    x_dtype = X_stacked.dtype
+    u_sq = sums[0]
+    x_sq = sums[1]
+    xu = sums[2]
+
+    u_norm = u_sq.sqrt().clamp_min(eps)
+    s_uf = adjusted_lr * radii / u_norm  # = lr * r / |U|
+    candidate_sq = (x_sq - 2.0 * s_uf * xu + s_uf * s_uf * u_sq).clamp_min(eps * eps)
+    candidate_norm = candidate_sq.sqrt()
+    scale_X_f = radii / candidate_norm   # = r / |candidate|
+    scale_U_f = s_uf * scale_X_f         # = lr*r / (|U| * |candidate|) * r
+
+    extra = X_stacked.ndim - 1
+    scale_X = scale_X_f.to(dtype=x_dtype)
+    scale_U = scale_U_f.to(dtype=x_dtype)
     for _ in range(extra):
-        scales = scales.unsqueeze(-1)
-    return candidate_stacked * scales
+        scale_X = scale_X.unsqueeze(-1)
+        scale_U = scale_U.unsqueeze(-1)
+    return X_stacked * scale_X - U_stacked * scale_U
 
 
 def muonh_update_post_orthogonalize_async(
@@ -466,8 +477,9 @@ def muonh_update_post_orthogonalize_async(
 ) -> Generator[None, None, None]:
     """Apply a scale-invariant hyperball step and project back to stored radii.
 
-    Pure-tensor sections are compiled and split around the optional async
-    all-reduces of the update / candidate Frobenius norms.
+    Folds the two FSDP2 reductions (update Frobenius norm and post-step
+    Frobenius norm) into a single all-reduce of [|U|^2, |X|^2, <X, U>], using
+    the closed form for |candidate|^2.
     """
     eps = float(epsilon)
     radii = torch.stack(list(R))
@@ -476,22 +488,14 @@ def muonh_update_post_orthogonalize_async(
     U_stacked = torch.stack(U).to(dtype=x_dtype)
     X_stacked = torch.stack(list(X))
 
-    update_sq_sums = _muonh_sq_sum_flat_compiled(U_stacked)
+    sums = _muonh_local_sums_compiled(X_stacked, U_stacked)
     if process_group is not None:
-        work = dist.all_reduce(update_sq_sums, group=process_group, async_op=True)
+        work = dist.all_reduce(sums, group=process_group, async_op=True)
         yield
         work.wait()
 
-    candidate_stacked, candidate_sq_sums = _muonh_step_compiled(
-        X_stacked, U_stacked, update_sq_sums, radii, adjusted_lr, eps,
-    )
-    if process_group is not None:
-        work = dist.all_reduce(candidate_sq_sums, group=process_group, async_op=True)
-        yield
-        work.wait()
-
-    final_stacked = _muonh_project_compiled(
-        candidate_stacked, candidate_sq_sums, radii, eps,
+    final_stacked = _muonh_apply_step_compiled(
+        X_stacked, U_stacked, sums, radii, adjusted_lr, eps,
     )
     torch._foreach_copy_(list(X), list(final_stacked.unbind(0)))
 
@@ -500,15 +504,3 @@ def _local_square_sums(tensors: List[Tensor]) -> Tensor:
     """Per-tensor sum of squares, fused via a single stack + flatten + sum."""
     stacked = torch.stack(tensors).float()
     return stacked.square().flatten(1).sum(dim=-1) if stacked.ndim > 1 else stacked.square()
-
-
-def _fro_norms_async(
-    tensors: List[Tensor],
-    process_group: Optional[ProcessGroup],
-) -> Generator[None, None, Tensor]:
-    sq_norms = _local_square_sums(tensors)
-    if process_group is not None:
-        work = dist.all_reduce(sq_norms, group=process_group, async_op=True)
-        yield
-        work.wait()
-    return sq_norms.sqrt()
