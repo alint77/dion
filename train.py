@@ -213,6 +213,9 @@ def parse_cli_args():
     parser.add_argument(
         "--use_gram_newton_schulz", action="store_true", help="Use Gram Newton-Schulz for orthogonalization"
     )
+    parser.add_argument(
+        "--split_heads", action="store_true", help="Split QKV params by head for orthogonalization"
+    )
 
     cli_args = parser.parse_args()
     if cli_args.config:
@@ -236,6 +239,7 @@ def parse_cli_args():
             "no_triton",
             "use_polar_express",
             "use_gram_newton_schulz",
+            "split_heads",
             "time_optimizer",
             "debug",
         ):

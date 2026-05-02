@@ -11,3 +11,4 @@ aztool/
 dion.egg-info/
 .vscode/
 .github/copilot-instructions.md
+benchmark_results/

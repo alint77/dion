@@ -211,6 +211,7 @@ def build_and_benchmark(
         replicate_mesh_grad_sync=False, fast_fsdp=False,
         debug=False, no_compile=True, no_triton=False,
         use_polar_express=False, use_gram_newton_schulz=False,
+        split_heads=False,
     )
 
     # Load YAML config if provided
