@@ -315,6 +315,7 @@ def sweep():
         {"optimizer": "dion2", "use_gram_newton_schulz": True, "split_heads": True, "ortho_fraction": frac}
         for frac in (1.0, 0.5, 0.25, 0.125)
     ] + [
+        {"optimizer": "dion2", "use_gram_newton_schulz": False, "split_heads": True, "ortho_fraction": 0.25},
         {"optimizer": "adamw"},
     ]
 
@@ -378,11 +379,74 @@ def sweep():
     return results
 
 
+def profile():
+    """
+    Profile optimizer.step() and export a Chrome trace.
+
+    Usage:
+      torchrun --standalone --nproc_per_node=1 benchmark_optimizer.py profile --config configs/benchmark_optimizer.yaml
+    """
+    torch._dynamo.config.cache_size_limit = 100
+
+    cli_args = parse_cli_args()
+
+    device_mesh = init_distributed_benchmark(
+        dp_size=cli_args.dp_size,
+        fs_size=cli_args.fs_size,
+        tp_size=cli_args.tp_size,
+    )
+
+    hp = Hyperparameters()
+    hp = override_args_from_cli(hp, cli_args)
+
+    model, optimizer = build_model_and_optimizer(hp, cli_args, device_mesh)
+
+    print0("=" * 80)
+    print0("Profiling optimizer step")
+    print0(f"GPU: {torch.cuda.get_device_name(0)}")
+    print0(f"Optimizer: {hp.optimizer}")
+    print0(f"Model dim: {hp.model_dim}, Layers: {hp.n_layer}, Heads: {hp.n_head}")
+    print0("=" * 80)
+
+    # Warmup
+    num_warmup = 5
+    for _ in range(num_warmup):
+        assign_fake_gradients(model)
+        optimizer.step()
+        optimizer.zero_grad()
+    torch.cuda.synchronize()
+
+    # Profile
+    num_profiled = 3
+    print0(f"Capturing {num_profiled} profiled iterations...")
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        with_stack=True,
+    ) as prof:
+        for _ in range(num_profiled):
+            assign_fake_gradients(model)
+            optimizer.step()
+            optimizer.zero_grad()
+
+    trace_path = "optimizer_trace.json"
+    prof.export_chrome_trace(trace_path)
+    print0(f"Trace exported to: {trace_path}")
+    print0("Open in chrome://tracing or https://ui.perfetto.dev")
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "sweep":
-        # Remove "sweep" from argv so argparse doesn't choke on it
         sys.argv.pop(1)
         sweep()
+    elif len(sys.argv) > 1 and sys.argv[1] == "profile":
+        sys.argv.pop(1)
+        profile()
     else:
         main()
