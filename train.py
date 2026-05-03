@@ -436,7 +436,7 @@ def init_optimizer(
             lr=hp.lr,
             mu=hp.mu,
             weight_decay=hp.weight_decay,
-            nesterov=True,
+            nesterov=False,
             adjust_lr=hp.adjust_lr,
             use_gram_newton_schulz=cli_args.use_gram_newton_schulz,
             use_triton=(not cli_args.no_triton),
@@ -494,7 +494,7 @@ def init_optimizer(
             mu=hp.mu,
             muon_beta2=0.95,
             weight_decay=hp.weight_decay,
-            nesterov=True,
+            nesterov=False,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
             use_polar_express=cli_args.use_polar_express,
@@ -520,7 +520,7 @@ def init_optimizer(
             lr=hp.lr,
             mu=hp.mu,
             weight_decay=hp.weight_decay,
-            nesterov=True,
+            nesterov=False,
             adjust_lr=hp.adjust_lr,
         )
 
