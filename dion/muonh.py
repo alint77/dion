@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.distributed as dist
 from collections import defaultdict
@@ -152,17 +153,20 @@ class MuonH(DistributedOrthoBase):
         return radius
 
     def _get_or_initialize_variance(
-        self, param: Tensor, state: dict, normalization: Optional[str]
+        self, param: Tensor, state: dict, normalization: Optional[str], flatten: bool
     ) -> Optional[Tensor]:
         if normalization is None:
             return None
 
         local = to_local(param)
-        shape = list(local.shape)
+        if flatten and local.ndim >= 3:
+            shape = [local.shape[0], math.prod(local.shape[1:])]
+        else:
+            shape = list(local.shape)
         if normalization == "neuron":
             shape[-1] = 1
         elif normalization == "short_axis":
-            red_dim = -1 if param.shape[-2] >= param.shape[-1] else -2
+            red_dim = -1 if shape[-2] >= shape[-1] else -2
             shape[red_dim] = 1
         else:
             raise ValueError(f"Unknown normalization: {normalization}")
@@ -263,7 +267,9 @@ class MuonH(DistributedOrthoBase):
                 shard_dim = sharded_tensor_dim
 
                 variances = [
-                    self._get_or_initialize_variance(p, s, normalization)
+                    self._get_or_initialize_variance(
+                        p, s, normalization, flatten=group["flatten"]
+                    )
                     for p, s in zip(params, states)
                 ]
                 radii = [
@@ -344,6 +350,7 @@ def muonh_update_megabatch_async(
             muon_beta2=muon_beta2,
             normalization=normalization,
             param_shape=X[0].shape,
+            flatten=flatten,
             shard_dim=shard_dim,
             process_group=process_group,
             epsilon=hyperball_eps,
@@ -399,6 +406,7 @@ def muonh_normalization_async(
     muon_beta2: Tensor,
     normalization: str,
     param_shape: torch.Size,
+    flatten: bool,
     shard_dim: Optional[int],
     process_group: Optional[ProcessGroup],
     epsilon: Tensor,
@@ -410,30 +418,48 @@ def muonh_normalization_async(
     """
     U_stacked = torch.stack(U)
     V_stacked = torch.stack(V)
+    original_shape = U_stacked.shape
+
+    local_shape = U[0].shape
+
+    if flatten and len(param_shape) >= 3:
+        U_stacked = U_stacked.flatten(start_dim=2)
+        flat_shape = torch.Size((local_shape[0], math.prod(local_shape[1:])))
+        shard_dim_neg = None
+        if shard_dim is not None:
+            shard_dim_pos = shard_dim if shard_dim >= 0 else shard_dim + len(param_shape)
+            shard_dim_neg = -2 if shard_dim_pos == 0 else -1
+    else:
+        flat_shape = local_shape
+        shard_dim_neg = None
+        if shard_dim is not None:
+            shard_dim_neg = shard_dim if shard_dim < 0 else shard_dim - len(local_shape)
 
     red_dim = -1
-    if normalization == "short_axis" and param_shape[-2] < param_shape[-1]:
+    if normalization == "short_axis" and flat_shape[-2] < flat_shape[-1]:
         red_dim = -2
 
     sum_sq = _muonh_sum_sq_compiled(U_stacked, red_dim)
-    shard_dim_neg = None
-    if shard_dim is not None:
-        shard_dim_neg = shard_dim if shard_dim < 0 else shard_dim - len(param_shape)
     if process_group is not None and shard_dim_neg == red_dim:
         work = dist.all_reduce(sum_sq, group=process_group, async_op=True)
         yield
         work.wait()
 
     normalized_U, V_stacked = _muonh_normalize_finish_compiled(
-        U_stacked, V_stacked, sum_sq, param_shape[red_dim], muon_beta2, float(epsilon),
+        U_stacked, V_stacked, sum_sq, flat_shape[red_dim], muon_beta2, float(epsilon),
     )
+
+    if flatten and len(param_shape) >= 3:
+        normalized_U = normalized_U.reshape(original_shape)
 
     torch._foreach_copy_(list(V), list(V_stacked.unbind(0)))
     return list(normalized_U.unbind(0))
 
 
 @torch.compile(fullgraph=True)
-def _muonh_local_sums_compiled(X_stacked: Tensor, U_stacked: Tensor) -> Tensor:
+def _muonh_local_sums_compiled(
+    X_stacked: Tensor, U_stacked: Tensor, flatten: bool
+) -> Tensor:
     """Per-matrix local |U|^2, |X|^2, <X, U> packed into one fp32 tensor.
 
     Packing into one tensor lets the caller fuse the three reductions into a
@@ -441,9 +467,10 @@ def _muonh_local_sums_compiled(X_stacked: Tensor, U_stacked: Tensor) -> Tensor:
     """
     X_f = X_stacked.float()
     U_f = U_stacked.float()
-    u_sq = U_f.square().sum(dim=(-2, -1))
-    x_sq = X_f.square().sum(dim=(-2, -1))
-    xu = (X_f * U_f).sum(dim=(-2, -1))
+    red_dims = tuple(range(1, X_stacked.ndim)) if flatten else (-2, -1)
+    u_sq = U_f.square().sum(dim=red_dims)
+    x_sq = X_f.square().sum(dim=red_dims)
+    xu = (X_f * U_f).sum(dim=red_dims)
     return torch.stack([u_sq, x_sq, xu], dim=0)
 
 
@@ -505,7 +532,7 @@ def muonh_update_post_orthogonalize_async(
     U_stacked = torch.stack(U).to(dtype=x_dtype)
     X_stacked = torch.stack(list(X))
 
-    sums = _muonh_local_sums_compiled(X_stacked, U_stacked)
+    sums = _muonh_local_sums_compiled(X_stacked, U_stacked, flatten)
     if process_group is not None:
         work = dist.all_reduce(sums, group=process_group, async_op=True)
         yield

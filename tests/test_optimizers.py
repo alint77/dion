@@ -189,6 +189,38 @@ class TestMuonH:
             atol=1e-5,
         )
 
+    @pytest.mark.parametrize("normalization", [None, "neuron", "short_axis"])
+    def test_flatten_3d_matches_explicit_2d(self, normalization):
+        from dion import MuonH
+
+        torch.manual_seed(13)
+        init = torch.randn(4, 32, 16, device=DEVICE)
+
+        packed = torch.nn.Parameter(init.clone())
+        packed_opt = MuonH(
+            [packed], lr=0.01, normalization=normalization, flatten=True
+        )
+
+        flat = torch.nn.Parameter(init.clone().flatten(start_dim=1))
+        flat_opt = MuonH(
+            [flat], lr=0.01, normalization=normalization, flatten=False
+        )
+
+        for step in range(3):
+            torch.manual_seed(300 + step)
+            grad = torch.randn_like(init)
+            packed.grad = grad.clone()
+            flat.grad = grad.flatten(start_dim=1).clone()
+            packed_opt.step()
+            flat_opt.step()
+
+        torch.testing.assert_close(
+            packed.data.flatten(start_dim=1),
+            flat.data,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
 
 # ---------------------------------------------------------------------------
 # NorMuon
@@ -270,6 +302,38 @@ class TestNorMuon:
         p2 = _make_params([(128, 64)])
         r2 = _run_steps(NorMuon, p2, dict(lr=0.01, normalization="short_axis"))
         torch.testing.assert_close(r1[0], r2[0], rtol=1e-3, atol=1e-4)
+
+    @pytest.mark.parametrize("normalization", ["neuron", "short_axis"])
+    def test_flatten_3d_matches_explicit_2d(self, normalization):
+        from dion import NorMuon
+
+        torch.manual_seed(17)
+        init = torch.randn(4, 32, 16, device=DEVICE)
+
+        packed = torch.nn.Parameter(init.clone())
+        packed_opt = NorMuon(
+            [packed], lr=0.01, normalization=normalization, flatten=True
+        )
+
+        flat = torch.nn.Parameter(init.clone().flatten(start_dim=1))
+        flat_opt = NorMuon(
+            [flat], lr=0.01, normalization=normalization, flatten=False
+        )
+
+        for step in range(3):
+            torch.manual_seed(400 + step)
+            grad = torch.randn_like(init)
+            packed.grad = grad.clone()
+            flat.grad = grad.flatten(start_dim=1).clone()
+            packed_opt.step()
+            flat_opt.step()
+
+        torch.testing.assert_close(
+            packed.data.flatten(start_dim=1),
+            flat.data,
+            rtol=1e-5,
+            atol=1e-5,
+        )
 
     def test_invalid_normalization(self):
         from dion import NorMuon

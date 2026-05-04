@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.distributed as dist
 from collections import defaultdict
@@ -124,7 +125,7 @@ class NorMuon(DistributedOrthoBase):
         return super()._get_or_initialize_state(param, algo)
 
     def _get_or_initialize_variance(
-        self, param: Tensor, state: dict, normalization: str
+        self, param: Tensor, state: dict, normalization: str, flatten: bool
     ) -> Tensor:
         """Lazily allocate the per-param variance EMA buffer.
 
@@ -137,11 +138,14 @@ class NorMuon(DistributedOrthoBase):
         the EMA is rebuilding from the new reduction axis.
         """
         local = to_local(param)
-        shape = list(local.shape)
+        if flatten and local.ndim >= 3:
+            shape = [local.shape[0], math.prod(local.shape[1:])]
+        else:
+            shape = list(local.shape)
         if normalization == "neuron":
             shape[-1] = 1
         elif normalization == "short_axis":
-            red_dim = -1 if param.shape[-2] >= param.shape[-1] else -2
+            red_dim = -1 if shape[-2] >= shape[-1] else -2
             shape[red_dim] = 1
         else:
             raise ValueError(f"Unknown normalization: {normalization}")
@@ -227,7 +231,9 @@ class NorMuon(DistributedOrthoBase):
                 # Variance buffer shape depends on normalization + (post-split)
                 # param shape, so initialize after head split.
                 variances_neuron = [
-                    self._get_or_initialize_variance(p, s, normalization)
+                    self._get_or_initialize_variance(
+                        p, s, normalization, flatten=group["flatten"]
+                    )
                     for p, s in zip(params, states)
                 ]
 
@@ -296,13 +302,21 @@ def normuon_update_megabatch_async(
     U_stacked = torch.stack(U)
     V_stacked = torch.stack(V_local)
     if normalization == "neuron":
-        U_stacked, V_stacked = normuon_normalization_stacked(U_stacked, V_stacked, muon_beta2)
+        if flatten and X[0].ndim >= 3:
+            U_stacked, V_stacked = normuon_normalization_stacked_flattened(
+                U_stacked, V_stacked, muon_beta2,
+            )
+        else:
+            U_stacked, V_stacked = normuon_normalization_stacked(
+                U_stacked, V_stacked, muon_beta2,
+            )
     elif normalization == "short_axis":
         U_stacked, V_stacked = yield from normuon_short_axis_normalization_async(
             U_stacked,
             V_stacked,
             muon_beta2=muon_beta2,
             param_shape=X[0].shape,
+            flatten=flatten,
             shard_dim=shard_dim,
             process_group=process_group,
         )
@@ -363,6 +377,7 @@ def normuon_short_axis_normalization_async(
     V: Tensor,  # [N, ..., 1]   (variance buffer, with 1 along the long axis)
     muon_beta2: Tensor,
     param_shape: torch.Size,
+    flatten: bool,
     shard_dim: Optional[int],
     process_group: Optional[ProcessGroup],
 ) -> Generator[None, None, Tuple[Tensor, Tensor]]:
@@ -376,22 +391,36 @@ def normuon_short_axis_normalization_async(
     Pure-tensor pre-/post-comm sections are compiled; the async dist.all_reduce
     sits in between and stays in eager Python.
     """
+    original_shape = U.shape
+    local_shape = U.shape[1:]
+    if flatten and len(param_shape) >= 3:
+        U = U.flatten(start_dim=2)
+        flat_shape = torch.Size((local_shape[0], math.prod(local_shape[1:])))
+        shard_dim_neg = None
+        if shard_dim is not None:
+            shard_dim_pos = shard_dim if shard_dim >= 0 else shard_dim + len(param_shape)
+            shard_dim_neg = -2 if shard_dim_pos == 0 else -1
+    else:
+        flat_shape = local_shape
+        shard_dim_neg = None
+        if shard_dim is not None:
+            shard_dim_neg = shard_dim if shard_dim < 0 else shard_dim - len(local_shape)
+
     red_dim = -1
-    if param_shape[-2] < param_shape[-1]:
+    if flat_shape[-2] < flat_shape[-1]:
         red_dim = -2
 
     sum_sq = _normuon_short_axis_sum_sq_compiled(U, red_dim)
-    shard_dim_neg = None
-    if shard_dim is not None:
-        shard_dim_neg = shard_dim if shard_dim < 0 else shard_dim - len(param_shape)
     if process_group is not None and shard_dim_neg == red_dim:
         work = dist.all_reduce(sum_sq, group=process_group, async_op=True)
         yield
         work.wait()
 
     normalized_U, V = _normuon_short_axis_finish_compiled(
-        U, V, sum_sq, param_shape[red_dim], muon_beta2,
+        U, V, sum_sq, flat_shape[red_dim], muon_beta2,
     )
+    if flatten and len(param_shape) >= 3:
+        normalized_U = normalized_U.reshape(original_shape)
     return normalized_U, V
 
 
@@ -428,3 +457,15 @@ def normuon_normalization_stacked(
     normalized_U = normalized_U * (norm_U / norm_U_new)
 
     return normalized_U, V
+
+
+@torch.compile(fullgraph=True)
+def normuon_normalization_stacked_flattened(
+    U: Tensor,
+    V: Tensor,
+    muon_beta2: Tensor,
+) -> Tuple[Tensor, Tensor]:
+    original_shape = U.shape
+    U = U.flatten(start_dim=2)
+    normalized_U, V = normuon_normalization_stacked(U, V, muon_beta2)
+    return normalized_U.reshape(original_shape), V
