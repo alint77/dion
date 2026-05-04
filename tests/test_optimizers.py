@@ -158,6 +158,37 @@ class TestMuonH:
         with pytest.raises(ValueError):
             MuonH(_make_params([(32, 64)]), normalization="invalid")
 
+    @pytest.mark.parametrize("normalization", [None, "neuron", "short_axis"])
+    def test_3d_experts_match_separate_params(self, normalization):
+        from dion import MuonH
+
+        torch.manual_seed(11)
+        init = torch.randn(4, 32, 16, device=DEVICE)
+
+        packed = torch.nn.Parameter(init.clone())
+        packed_opt = MuonH([packed], lr=0.01, normalization=normalization)
+
+        separate = [
+            torch.nn.Parameter(init[i].clone()) for i in range(init.shape[0])
+        ]
+        separate_opt = MuonH(separate, lr=0.01, normalization=normalization)
+
+        for step in range(3):
+            torch.manual_seed(200 + step)
+            grad = torch.randn_like(init)
+            packed.grad = grad.clone()
+            for i, p in enumerate(separate):
+                p.grad = grad[i].clone()
+            packed_opt.step()
+            separate_opt.step()
+
+        torch.testing.assert_close(
+            packed.data,
+            torch.stack([p.data for p in separate]),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
 
 # ---------------------------------------------------------------------------
 # NorMuon
@@ -392,13 +423,39 @@ class TestNumHeads:
         from dion import NorMuon
         self._run_parity(NorMuon, dict(lr=0.01, normalization="short_axis"))
 
-    def test_muonh_matches_3d(self):
+    def test_muonh_rejects_num_heads(self):
         from dion import MuonH
-        self._run_parity(MuonH, dict(lr=0.01))
+        w = torch.nn.Parameter(torch.randn(32, 16, device=DEVICE))
+        w.grad = torch.randn_like(w)
+        opt = MuonH([{"params": [w], "num_heads": 4}], lr=0.01)
+        with pytest.raises(ValueError, match="does not support num_heads"):
+            opt.step()
 
-    def test_muonh_matches_3d_short_axis(self):
+    def test_muonh_rejects_num_heads_short_axis(self):
         from dion import MuonH
-        self._run_parity(MuonH, dict(lr=0.01, normalization="short_axis"))
+        w = torch.nn.Parameter(torch.randn(32, 16, device=DEVICE))
+        w.grad = torch.randn_like(w)
+        opt = MuonH(
+            [{"params": [w], "num_heads": 4}],
+            lr=0.01,
+            normalization="short_axis",
+        )
+        with pytest.raises(ValueError, match="does not support num_heads"):
+            opt.step()
+
+    def test_muonh_num_heads_one_is_noop(self):
+        from dion import MuonH
+        w = torch.nn.Parameter(torch.randn(32, 16, device=DEVICE))
+        w_ref = torch.nn.Parameter(w.data.clone())
+        g = torch.randn_like(w)
+        for _ in range(2):
+            w.grad = g.clone()
+            w_ref.grad = g.clone()
+        opt = MuonH([{"params": [w], "num_heads": 1}], lr=0.01)
+        opt_ref = MuonH([w_ref], lr=0.01)
+        opt.step()
+        opt_ref.step()
+        torch.testing.assert_close(w.data, w_ref.data)
 
     def test_muon_invalid_num_heads(self):
         from dion import Muon

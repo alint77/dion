@@ -139,6 +139,18 @@ class MuonH(DistributedOrthoBase):
             )
         return state
 
+    def _get_or_initialize_hyperball_radius(
+        self, param: Tensor, state: dict, flatten: bool
+    ) -> Tensor:
+        local = to_local(param)
+        shape = () if flatten or local.ndim == 2 else tuple(local.shape[:-2])
+        radius = state.get("hyperball_radius")
+        if radius is None or tuple(radius.shape) != shape:
+            radius = torch.zeros(shape, device=local.device, dtype=torch.float32)
+            state["hyperball_radius"] = radius
+            state["hyperball_radius_initialized"] = torch.zeros((), dtype=torch.bool)
+        return radius
+
     def _get_or_initialize_variance(
         self, param: Tensor, state: dict, normalization: Optional[str]
     ) -> Optional[Tensor]:
@@ -166,15 +178,15 @@ class MuonH(DistributedOrthoBase):
         params: List[Tensor],
         states: List[dict],
         process_group: Optional[ProcessGroup],
-        shard_dim: Optional[int],
+        flatten: bool,
         hyperball_eps: Tensor,
     ):
         if all(s["hyperball_radius_initialized"] for s in states):
             return
 
         local_params = to_local(params)
-        sq_norms = _local_square_sums(local_params)
-        if process_group is not None and shard_dim is not None:
+        sq_norms = _local_square_sums(local_params, flatten=flatten)
+        if process_group is not None:
             dist.all_reduce(sq_norms, group=process_group)
         radii = sq_norms.sqrt()
 
@@ -236,32 +248,35 @@ class MuonH(DistributedOrthoBase):
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, self._algo_name) for p in params]
                 momentums = [s["momentum"] for s in states]
-
                 if num_heads is not None:
-                    params, gradients, momentums = self._prepare_head_split(
-                        num_heads, params, gradients, momentums
+                    raise ValueError(
+                        "MuonH does not support num_heads > 1. Split heads into "
+                        "explicit parameters or use a native 3D parameter instead."
                     )
+
+                is_batch_sharded, is_matrix_sharded, sharded_tensor_dim = (
+                    self._get_shard_info(params[0], group)
+                )
+                megabatch_args = update_args
+                if is_batch_sharded and not is_matrix_sharded:
                     megabatch_args = {**update_args, "process_group": None}
-                    shard_dim = None
-                else:
-                    is_batch_sharded, is_matrix_sharded, sharded_tensor_dim = (
-                        self._get_shard_info(params[0], group)
-                    )
-                    megabatch_args = update_args
-                    if is_batch_sharded and not is_matrix_sharded:
-                        megabatch_args = {**update_args, "process_group": None}
-                    shard_dim = sharded_tensor_dim
+                shard_dim = sharded_tensor_dim
 
                 variances = [
                     self._get_or_initialize_variance(p, s, normalization)
                     for p, s in zip(params, states)
                 ]
-                radii = [s["hyperball_radius"] for s in states]
+                radii = [
+                    self._get_or_initialize_hyperball_radius(
+                        p, s, flatten=group["flatten"]
+                    )
+                    for p, s in zip(params, states)
+                ]
                 self._initialize_hyperball_radii(
                     params=params,
                     states=states,
-                    process_group=megabatch_args["process_group"],
-                    shard_dim=shard_dim,
+                    process_group=megabatch_args["process_group"] if shard_dim is not None else None,
+                    flatten=group["flatten"],
                     hyperball_eps=hyperball_eps,
                 )
 
@@ -343,14 +358,14 @@ def muonh_update_megabatch_async(
     else:
         raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
 
-    norm_group = process_group if shard_dim is not None else None
     yield from muonh_update_post_orthogonalize_async(
         X=to_local(X),
         U=U,
         R=R,
         adjusted_lr=adjusted_lr,
         epsilon=hyperball_eps,
-        process_group=norm_group,
+        flatten=flatten,
+        process_group=process_group if shard_dim is not None else None,
     )
 
 
@@ -419,16 +434,16 @@ def muonh_normalization_async(
 
 @torch.compile(fullgraph=True)
 def _muonh_local_sums_compiled(X_stacked: Tensor, U_stacked: Tensor) -> Tensor:
-    """Per-matrix local |U|^2, |X|^2, <X, U>, packed into a single [3, N] fp32 tensor.
+    """Per-matrix local |U|^2, |X|^2, <X, U> packed into one fp32 tensor.
 
     Packing into one tensor lets the caller fuse the three reductions into a
     single async all-reduce instead of issuing one round per quantity.
     """
     X_f = X_stacked.float()
     U_f = U_stacked.float()
-    u_sq = U_f.square().flatten(1).sum(dim=-1)
-    x_sq = X_f.square().flatten(1).sum(dim=-1)
-    xu = (X_f * U_f).flatten(1).sum(dim=-1)
+    u_sq = U_f.square().sum(dim=(-2, -1))
+    x_sq = X_f.square().sum(dim=(-2, -1))
+    xu = (X_f * U_f).sum(dim=(-2, -1))
     return torch.stack([u_sq, x_sq, xu], dim=0)
 
 
@@ -436,10 +451,11 @@ def _muonh_local_sums_compiled(X_stacked: Tensor, U_stacked: Tensor) -> Tensor:
 def _muonh_apply_step_compiled(
     X_stacked: Tensor,
     U_stacked: Tensor,
-    sums: Tensor,  # [3, N]: [|U|^2, |X|^2, <X, U>]
+    sums: Tensor,
     radii: Tensor,
     adjusted_lr: Tensor,
     eps: float,
+    flatten: bool,
 ) -> Tensor:
     """Apply hyperball step + Frobenius-sphere projection in one fused multiply-subtract.
 
@@ -458,7 +474,7 @@ def _muonh_apply_step_compiled(
     scale_X_f = radii / candidate_norm   # = r / |candidate|
     scale_U_f = s_uf * scale_X_f         # = lr*r / (|U| * |candidate|) * r
 
-    extra = X_stacked.ndim - 1
+    extra = X_stacked.ndim - 1 if flatten else 2
     scale_X = scale_X_f.to(dtype=x_dtype)
     scale_U = scale_U_f.to(dtype=x_dtype)
     for _ in range(extra):
@@ -473,6 +489,7 @@ def muonh_update_post_orthogonalize_async(
     R: List[Tensor],
     adjusted_lr: Tensor,
     epsilon: Tensor,
+    flatten: bool,
     process_group: Optional[ProcessGroup],
 ) -> Generator[None, None, None]:
     """Apply a scale-invariant hyperball step and project back to stored radii.
@@ -495,12 +512,14 @@ def muonh_update_post_orthogonalize_async(
         work.wait()
 
     final_stacked = _muonh_apply_step_compiled(
-        X_stacked, U_stacked, sums, radii, adjusted_lr, eps,
+        X_stacked, U_stacked, sums, radii, adjusted_lr, eps, flatten,
     )
     torch._foreach_copy_(list(X), list(final_stacked.unbind(0)))
 
 
-def _local_square_sums(tensors: List[Tensor]) -> Tensor:
+def _local_square_sums(tensors: List[Tensor], flatten: bool) -> Tensor:
     """Per-tensor sum of squares, fused via a single stack + flatten + sum."""
     stacked = torch.stack(tensors).float()
-    return stacked.square().flatten(1).sum(dim=-1) if stacked.ndim > 1 else stacked.square()
+    if flatten:
+        return stacked.square().flatten(1).sum(dim=-1)
+    return stacked.square().sum(dim=(-2, -1))
