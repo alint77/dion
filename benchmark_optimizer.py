@@ -10,8 +10,8 @@ Usage:
   torchrun --standalone --nproc_per_node=4 benchmark_optimizer.py --config configs/dion2_160m.yaml --fs_size 4
 
   # Sweep across configurations:
-  CUDA_VISIBLE_DEVICES=3 torchrun --standalone --nproc_per_node=1 benchmark_optimizer.py sweep
-  torchrun --standalone --nproc_per_node=4 benchmark_optimizer.py sweep --fs_size 4 --config configs/muon_160m.yaml
+  CUDA_VISIBLE_DEVICES=3 torchrun --standalone --nproc_per_node=1 benchmark_optimizer.py sweep --name benchmark_results/timing_sweep
+  torchrun --standalone --nproc_per_node=4 benchmark_optimizer.py sweep --fs_size 4 --config configs/muon_160m.yaml --name benchmark_results/timing_sweep
 
   # Programmatic sweep (from another script):
   from benchmark_optimizer import build_and_benchmark, init_distributed_benchmark
@@ -20,9 +20,12 @@ Usage:
 """
 
 import argparse
+import dataclasses
+import json
 import os
 import torch
 import torch.distributed as dist
+from datetime import datetime
 
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DeviceMesh
@@ -248,6 +251,8 @@ def build_and_benchmark(
         "times_ms": times_ms,
         "num_params": num_params,
         "hp": hp,
+        "gpu_name": torch.cuda.get_device_name(0),
+        "num_gpus": dist.get_world_size() if dist.is_initialized() else 1,
     }
 
 
@@ -293,10 +298,14 @@ def main():
         dist.destroy_process_group()
 
 
-def sweep():
+def sweep(name: Optional[str] = None):
     """
     Run optimizer step benchmark across a predefined list of configurations.
     Edit CONFIG and SWEEP_OVERRIDES below to customize.
+
+    Args:
+        name: Optional prefix for the output JSON filename. The file is saved as
+              "{name}_{timestamp}.json" (or just "{timestamp}.json" if name is None).
 
     Usage:
       torchrun --standalone --nproc_per_node=1 benchmark_optimizer.py sweep
@@ -353,6 +362,7 @@ def sweep():
             num_warmup=25,
             num_iterations=100,
         )
+        result["merged_overrides"] = merged_overrides
         result["overrides"] = sweep_overrides
         results.append(result)
 
@@ -373,6 +383,19 @@ def sweep():
             f"{min(r['times_ms']):>10.3f} | {max(r['times_ms']):>10.3f}"
         )
     print0("=" * table_width)
+
+    # Write results to JSON (only on master process)
+    if int(os.environ.get("RANK", 0)) == 0:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{name}_{timestamp}.json" if name else f"{timestamp}.json"
+        serializable_results = []
+        for r in results:
+            sr = dict(r)
+            sr["hp"] = dataclasses.asdict(sr["hp"])
+            serializable_results.append(sr)
+        with open(filename, "w") as f:
+            json.dump(serializable_results, f, indent=2)
+        print0(f"Results saved to: {filename}")
 
     if dist.is_initialized():
         dist.destroy_process_group()
@@ -445,7 +468,14 @@ if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "sweep":
         sys.argv.pop(1)
-        sweep()
+        # Extract --name argument before passing to parse_cli_args
+        sweep_name = None
+        if "--name" in sys.argv:
+            idx = sys.argv.index("--name")
+            sweep_name = sys.argv[idx + 1]
+            sys.argv.pop(idx)  # remove --name
+            sys.argv.pop(idx)  # remove the value
+        sweep(name=sweep_name)
     elif len(sys.argv) > 1 and sys.argv[1] == "profile":
         sys.argv.pop(1)
         profile()
