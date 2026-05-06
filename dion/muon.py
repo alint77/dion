@@ -202,6 +202,11 @@ def muon_update_megabatch_async(
     # Convert shard_dim to negative for comm_dim
     comm_dim = (shard_dim - X[0].ndim) if shard_dim is not None else None
 
+    # X[0] is still a DTensor here, so .shape[comm_dim] is the global
+    # (unsharded) size. The megabatch fn uses this to compute the rank-
+    # consistent pad size for its alltoall.
+    global_comm_dim_size = X[0].shape[comm_dim] if comm_dim is not None else None
+
     # Orthogonalize via shared megabatch communication
     U = yield from megabatch_orthogonalize_async(
         U,
@@ -212,6 +217,7 @@ def muon_update_megabatch_async(
         newton_schulz_func=newton_schulz_func,
         flatten=flatten,
         epsilon=epsilon,
+        global_comm_dim_size=global_comm_dim_size,
     )
 
     # Compute scaled learning rate
