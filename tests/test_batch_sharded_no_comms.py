@@ -257,9 +257,9 @@ def main():
     original_all_gather = dist.all_gather
 
     optimizers_to_test = [
-        ("Muon", Muon, dict(lr=0.01, flatten=False, use_gram_newton_schulz=True)),
-        ("Dion2", Dion2, dict(lr=0.01, flatten=False, use_gram_newton_schulz=True)),
-        ("NorMuon", NorMuon, dict(lr=0.01, flatten=False, use_gram_newton_schulz=True)),
+        ("Muon", Muon, dict(lr=0.01, flatten=False, use_gns_package=True, use_gns_alg=True)),
+        ("Dion2", Dion2, dict(lr=0.01, flatten=False, use_gns_package=True, use_gns_alg=True)),
+        ("NorMuon", NorMuon, dict(lr=0.01, flatten=False, use_gns_package=True, use_gns_alg=True)),
     ]
 
     ok = run_manual_tests(rank, mesh, device, optimizers_to_test, original_all_to_all, original_all_gather)

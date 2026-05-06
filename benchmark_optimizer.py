@@ -210,7 +210,7 @@ def build_and_benchmark(
         no_wandb=True, wandb_project_name=None, wandb_job_name=None,
         replicate_mesh_grad_sync=False, fast_fsdp=False,
         debug=False, no_compile=True, no_triton=False,
-        use_polar_express=False, use_gram_newton_schulz=False,
+        use_polar_express=False, use_gns_package=False, use_gns_alg=False, 
         split_heads=False,
     )
 
@@ -307,15 +307,16 @@ def sweep():
     DEFAULT_CONFIG = "configs/benchmark_optimizer.yaml"
 
     SWEEP_OVERRIDES = [
-        {"optimizer": "muon", "no_triton": True, "use_gram_newton_schulz": False, "split_heads": False},
-        {"optimizer": "muon", "use_gram_newton_schulz": False, "split_heads": False},
-        {"optimizer": "muon", "use_gram_newton_schulz": True, "split_heads": False},
-        {"optimizer": "muon", "use_gram_newton_schulz": True, "split_heads": True},
+        {"optimizer": "muon", "no_triton": True, "use_gns_package": False, "use_gns_alg": False, "split_heads": False},
+        {"optimizer": "muon", "use_gns_package": False, "use_gns_alg": False, "split_heads": False},
+        {"optimizer": "muon", "use_gns_package": True, "use_gns_alg": False, "split_heads": False},
+        {"optimizer": "muon", "use_gns_package": True, "use_gns_alg": True, "split_heads": False},
+        {"optimizer": "muon", "use_gns_package": True, "use_gns_alg": True, "split_heads": True},
     ] + [
-        {"optimizer": "dion2", "use_gram_newton_schulz": True, "split_heads": True, "ortho_fraction": frac}
+        {"optimizer": "dion2", "use_gns_package": True, "use_gns_alg": True, "split_heads": True, "ortho_fraction": frac}
         for frac in (1.0, 0.5, 0.25, 0.125)
     ] + [
-        {"optimizer": "dion2", "use_gram_newton_schulz": False, "split_heads": True, "ortho_fraction": 0.25},
+        {"optimizer": "dion2", "use_gns_package": True, "use_gns_alg": True, "split_heads": True, "ortho_fraction": 0.25},
         {"optimizer": "adamw"},
     ]
 

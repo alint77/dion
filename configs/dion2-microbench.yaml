@@ -31,6 +31,7 @@ ortho_fraction: 1.0
 adjust_lr: spectral_norm
 lr: 0.02
 use_polar_express: true
-use_gram_newton_schulz: true
+use_gns_package: true
+use_gns_alg: true
 split_heads: false
 time_optimizer: true
