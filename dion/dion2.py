@@ -64,6 +64,7 @@ class Dion2(DistributedOrthoBase):
         use_gram_newton_schulz: bool = False,
         newton_schulz_func: Optional[Callable] = None,
         verbose: bool = False,
+        triton_post_ortho: bool = False,
     ):
         # Validate hyperparameters
         if lr < 0.0:
@@ -100,6 +101,14 @@ class Dion2(DistributedOrthoBase):
             newton_schulz_func=newton_schulz_func,
         )
         self.verbose = verbose
+        if triton_post_ortho:
+            from .dion2_triton import TRITON_AVAILABLE
+            if not TRITON_AVAILABLE:
+                raise ImportError(
+                    "triton_post_ortho=True requires the 'triton' package, which is not installed. "
+                    "Install it with: pip install dion[triton]  (or: pip install triton)"
+                )
+        self._triton_post_ortho = triton_post_ortho
 
     def _create_ortho_tasks(
         self, param_groups: List[dict]
@@ -131,6 +140,7 @@ class Dion2(DistributedOrthoBase):
                 process_group=self._process_group,
                 newton_schulz_func=self._newton_schulz_func,
                 verbose=self.verbose,
+                triton_post_ortho=self._triton_post_ortho,
             )
 
             shape_groups: dict[tuple, list] = defaultdict(list)
@@ -188,6 +198,7 @@ def dion2_update_megabatch_async(
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
     verbose: bool = False,
+    triton_post_ortho: bool = False,
 ) -> Generator[None, None, None]:
     """
     Mega-batched Dion2 update: processes ALL same-shape parameters in one
@@ -229,6 +240,21 @@ def dion2_update_megabatch_async(
     # comm_dim for sharded communication: use select_dim (which equals normalized shard_dim)
     comm_dim = select_dim if is_sharded else None
 
+    # On the sharded path X[0] must still be a DTensor, so .shape[comm_dim]
+    # is the unsharded global size. The megabatch fn uses this to compute
+    # the rank-consistent pad size for its alltoall. Catch the case where a
+    # future refactor moves to_local(X) above this point and silently
+    # collapses .shape to the local size.
+    if comm_dim is not None:
+        if not isinstance(X[0], DTensor):
+            raise TypeError(
+                "Sharded path requires X[0] to be a DTensor so .shape gives "
+                f"the global size; got {type(X[0]).__name__}."
+            )
+        global_comm_dim_size = X[0].shape[comm_dim]
+    else:
+        global_comm_dim_size = None
+
     # Orthogonalize via shared megabatch communication
     U_ortho = yield from megabatch_orthogonalize_async(
         U_selected,
@@ -239,6 +265,7 @@ def dion2_update_megabatch_async(
         newton_schulz_func=newton_schulz_func,
         flatten=flatten,
         epsilon=epsilon,
+        global_comm_dim_size=global_comm_dim_size,
     )
 
     # Compute scaled learning rate
@@ -252,16 +279,29 @@ def dion2_update_megabatch_async(
     else:
         raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
 
-    # Post-orthogonalize: apply update to selected indices only
-    dion2_post_orthogonalize(
-        X=to_local(X),
-        U=U_ortho,
-        indices=indices_list,
-        base_lr=lr,
-        adjusted_lr=adjusted_lr,
-        weight_decay=weight_decay,
-        select_dim=select_dim,
-    )
+    # Post-orthogonalize: apply update
+    if triton_post_ortho:
+        from .dion2_triton import dion2_post_orthogonalize_triton
+
+        dion2_post_orthogonalize_triton(
+            X=to_local(X),
+            U=U_ortho,
+            indices=indices_list,
+            base_lr=lr,
+            adjusted_lr=adjusted_lr,
+            weight_decay=weight_decay,
+            select_dim=select_dim,
+        )
+    else:
+        dion2_post_orthogonalize(
+            X=to_local(X),
+            U=U_ortho,
+            indices=indices_list,
+            base_lr=lr,
+            adjusted_lr=adjusted_lr,
+            weight_decay=weight_decay,
+            select_dim=select_dim,
+        )
 
 
 # Workaround for a torch.compile bug in PyTorch ≤2.11's inductor backend:
