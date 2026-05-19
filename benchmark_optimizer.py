@@ -212,7 +212,7 @@ def build_and_benchmark(
         sequence_length=None, warmup_ratio=None, warmdown_ratio=None,
         no_wandb=True, wandb_project_name=None, wandb_job_name=None,
         replicate_mesh_grad_sync=False, fast_fsdp=False,
-        debug=False, no_compile=True, no_triton=False,
+        debug=False, no_compile=True, no_triton=False, no_triton_post_orthogonalize=False,
         use_polar_express=False, use_gns_package=False, use_gns_alg=False, 
         split_heads=False,
     )

@@ -21,6 +21,7 @@ set -euo pipefail
 #   cjob_benchmark.sh --config configs/dion2_160m.yaml -- --model_dim 5120
 #   cjob_benchmark.sh --gpus 4 -- --fs_size 4
 #   cjob_benchmark.sh -- --model_dim 5120 --n_head 32 --n_layer 20
+#   cjob_benchmark.sh --gpus 8 -- --model_dim 5120 --n_head 40 --n_layer 40
 
 CJOB="${CJOB:-/data/cluster-jobs/cjob}"
 WORKTREE="$HOME/dion"

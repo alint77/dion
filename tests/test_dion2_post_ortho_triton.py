@@ -226,13 +226,13 @@ class TestDion2TritonEndToEnd:
         ([(64, 128)] * 4, 0.25, 0.9),
     ])
     @pytest.mark.parametrize("use_triton", [False, True])
-    @pytest.mark.parametrize("use_gram_newton_schulz", [False, True])
+    @pytest.mark.parametrize("use_gns_package", [False, True])
     @pytest.mark.parametrize("param_dtype", [torch.float32, torch.bfloat16])
-    def test_triton_vs_default(self, shapes, fraction, ef_decay, use_triton, use_gram_newton_schulz, param_dtype):
+    def test_triton_vs_default(self, shapes, fraction, ef_decay, use_triton, use_gns_package, param_dtype):
         """Triton post-ortho should match default up to fused-rounding tolerance."""
         kwargs = dict(
             lr=0.01, fraction=fraction, ef_decay=ef_decay,
-            use_triton=use_triton, use_gram_newton_schulz=use_gram_newton_schulz,
+            use_triton=use_triton, use_gns_package=use_gns_package, use_gns_alg=True,
         )
 
         p_default = self._make_params(shapes, dtype=param_dtype)

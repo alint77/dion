@@ -208,6 +208,9 @@ def parse_cli_args():
         "--no_triton", action="store_true", help="Disable Triton kernels"
     )
     parser.add_argument(
+        "--no_triton_post_orthogonalize", action="store_true", help="Disable Triton kernel for post-orthogonalization"
+    )
+    parser.add_argument(
         "--use_polar_express", action="store_true", help="Use Polar Express for orthogonalization"
     )
     parser.add_argument(
@@ -240,6 +243,7 @@ def parse_cli_args():
             "no_wandb",
             "no_compile",
             "no_triton",
+            "no_triton_post_orthogonalize",
             "use_polar_express",
             "use_gns_package",
             "use_gns_alg",
@@ -489,6 +493,7 @@ def init_optimizer(
             comm_method = "all-gather"
         print0(f"LR adjust method: {hp.adjust_lr}")
         print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
+        print0(f"Triton post-orthogonalize: {not cli_args.no_triton_post_orthogonalize}")
         print0(f"Distributed Dion2 using: {comm_method}")
         opt = Dion2(
             param_groups,
@@ -503,7 +508,7 @@ def init_optimizer(
             use_triton=(not cli_args.no_triton),
             use_polar_express=cli_args.use_polar_express,
             verbose=hp.verbose,
-            triton_post_ortho=(not cli_args.no_triton),
+            triton_post_ortho=(not cli_args.no_triton_post_orthogonalize),
         )
     elif hp.optimizer == "normuon":
         if device_mesh is not None:

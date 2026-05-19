@@ -30,6 +30,7 @@ def plot_sweep(json_path: str, ax=None):
     print("num_gpus", df["num_gpus"].unique())
     print("model_dim", df["model_dim"].unique())
     print("n_layer", df["n_layer"].unique())
+    print("conditions", df["condition"].unique())
 
     keeping = [
         "baseline",
