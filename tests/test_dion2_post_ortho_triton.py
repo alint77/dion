@@ -14,8 +14,13 @@ Two levels of testing:
 import math
 import pytest
 import torch
+from torch.utils._python_dispatch import (
+    is_traceable_wrapper_subclass,
+    return_and_correct_aliasing,
+)
+from torch.utils._pytree import tree_map
 
-from dion.dion2 import dion2_post_orthogonalize
+from dion.dion2 import dion2_post_orthogonalize, dion2_post_orthogonalize_fused
 from dion.dion2_triton import TRITON_AVAILABLE, dion2_post_orthogonalize_triton
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -85,6 +90,109 @@ def _build_selected_mask(indices, select_dim, shape):
         full_mask = col_mask.unsqueeze(-2).expand(flat_leading, M, N)
 
     return full_mask.reshape(shape)
+
+
+class _MockWrapperTensor(torch.Tensor):
+    # Minimal traceable wrapper subclass standing in for a quantized-weight wrapper
+    # such as MXFP8 training's MXFP8TrainingWeightWrapperTensor: it holds its data in
+    # a wrapped inner tensor and exposes no dense buffer at data_ptr() (data_ptr() is
+    # 0). A raw Triton kernel writing through that pointer would fault, so the entry
+    # point must route through __torch_dispatch__ instead. is_traceable_wrapper_subclass
+    # returns True for this type but False for plain dense subclasses like nn.Parameter.
+    @staticmethod
+    def __new__(cls, inner):
+        return torch.Tensor._make_wrapper_subclass(
+            cls,
+            inner.shape,
+            dtype=inner.dtype,
+            device=inner.device,
+            layout=inner.layout,
+            strides=inner.stride(),
+            requires_grad=False,
+        )
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __tensor_flatten__(self):
+        return ["_inner"], None
+
+    @staticmethod
+    def __tensor_unflatten__(inner_tensors, meta, outer_size, outer_stride):
+        return _MockWrapperTensor(inner_tensors["_inner"])
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        unwrap = lambda t: t._inner if isinstance(t, _MockWrapperTensor) else t
+        wrap = lambda t: _MockWrapperTensor(t) if isinstance(t, torch.Tensor) else t
+        out = func(
+            *tree_map(unwrap, args), **tree_map(unwrap, kwargs)
+        )
+        out = tree_map(wrap, out)
+        return return_and_correct_aliasing(func, args, kwargs, out)
+
+
+@pytest.mark.parametrize("shape", [(64, 128), (4, 32, 128)])
+@pytest.mark.parametrize("select_dim", [-2, -1])
+@pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
+def test_post_ortho_triton_falls_back_for_wrapper_subclass(shape, select_dim, x_dtype):
+    k = 16
+    X, U, indices = _make_test_data(shape, k, select_dim, x_dtype=x_dtype)
+    base_lr = torch.tensor(0.1, device=DEVICE)
+    adjusted_lr = torch.tensor(0.05, device=DEVICE)
+    weight_decay = torch.tensor(0.01, device=DEVICE)
+
+    # A wrapper subclass routes to the single-rounding dion2_post_orthogonalize_fused
+    # (dispatch-safe), not the raw kernel and not the two-rounding eager path.
+    x_ref = X.clone()
+    dion2_post_orthogonalize_fused(
+        [x_ref], [U], [indices], base_lr, adjusted_lr, weight_decay, select_dim
+    )
+
+    x_sub = _MockWrapperTensor(X.clone())
+    dion2_post_orthogonalize_triton(
+        [x_sub], [U], [indices], base_lr, adjusted_lr, weight_decay, select_dim
+    )
+
+    assert type(x_sub) is _MockWrapperTensor
+    torch.testing.assert_close(x_sub._inner, x_ref, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not TRITON_AND_CUDA, reason="CUDA and Triton required")
+@pytest.mark.parametrize("shape", [(64, 128), (4, 32, 128)])
+@pytest.mark.parametrize("select_dim", [-2, -1])
+def test_fused_eager_matches_kernel_single_rounding(shape, select_dim):
+    k = 16
+    X, U, indices = _make_test_data(shape, k, select_dim, x_dtype=torch.bfloat16)
+    base_lr = torch.tensor(0.1, device=DEVICE)
+    adjusted_lr = torch.tensor(0.05, device=DEVICE)
+    weight_decay = torch.tensor(0.01, device=DEVICE)
+    kwargs = dict(indices=[indices], base_lr=base_lr, adjusted_lr=adjusted_lr,
+                  weight_decay=weight_decay, select_dim=select_dim)
+
+    x_kernel = X.clone()
+    dion2_post_orthogonalize_triton(X=[x_kernel], U=[U.clone()], **kwargs)
+    x_fused = X.clone()
+    dion2_post_orthogonalize_fused(X=[x_fused], U=[U.clone()], **kwargs)
+    x_eager = X.clone()
+    dion2_post_orthogonalize(X=[x_eager], U=[U.clone()], **kwargs)
+
+    sel = _build_selected_mask(indices, select_dim, shape)
+    # The dispatch-safe fused path reproduces the kernel's single rounding:
+    # unselected entries are bit-identical, selected match within bf16 rounding.
+    torch.testing.assert_close(x_fused[~sel], x_kernel[~sel], rtol=0, atol=0)
+    torch.testing.assert_close(x_fused, x_kernel, rtol=5e-3, atol=5e-3)
+    # And it differs from the two-rounding eager path on the selected slices.
+    assert not torch.equal(x_fused[sel], x_eager[sel])
+
+
+def test_post_ortho_triton_keeps_kernel_for_nn_parameter():
+    # nn.Parameter has type(p) is not torch.Tensor but is NOT a wrapper subclass:
+    # it must stay on the Triton kernel, not fall back. Guarding on
+    # is_traceable_wrapper_subclass (not type identity) preserves the fast path for
+    # the single-GPU/DDP case where params reach the kernel as nn.Parameter.
+    assert not is_traceable_wrapper_subclass(torch.nn.Parameter(torch.empty(2, 2)))
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +338,9 @@ class TestDion2TritonEndToEnd:
     @pytest.mark.parametrize("param_dtype", [torch.float32, torch.bfloat16])
     def test_triton_vs_default(self, shapes, fraction, ef_decay, use_triton, use_gns_package, param_dtype):
         """Triton post-ortho should match default up to fused-rounding tolerance."""
+        if use_gram_newton_schulz:
+            pytest.importorskip("gram_newton_schulz", reason="optional dion[gram-newton-schulz] extra not installed")
+
         kwargs = dict(
             lr=0.01, fraction=fraction, ef_decay=ef_decay,
             use_triton=use_triton, use_gns_package=use_gns_package, use_gns_alg=True,

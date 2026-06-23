@@ -1,5 +1,6 @@
 import torch
 from torch import Tensor
+from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 from typing import List
 
 try:
@@ -158,17 +159,44 @@ def dion2_post_orthogonalize_triton(
         base_lr, adjusted_lr, weight_decay: scalar tensors
         select_dim: -2 (row selection) or -1 (column selection)
     """
-    if not TRITON_AVAILABLE:
-        raise RuntimeError("Triton is required for dion2_post_orthogonalize_triton")
-
     if select_dim not in (-2, -1):
         raise ValueError(f"select_dim must be -2 or -1, got {select_dim}")
+
+    # The kernel writes X in-place through a raw data pointer, which is only valid
+    # for tensors backed by a dense buffer in their logical dtype/layout. Traceable
+    # wrapper subclasses (e.g. the quantized-weight wrappers used by MXFP8 training,
+    # or DTensor) hold their data in wrapped inner tensors and do not expose such a
+    # buffer at data_ptr(), so a raw write corrupts memory and triggers an illegal
+    # memory access. Fall back to dion2_post_orthogonalize_fused, which routes
+    # through __torch_dispatch__ and updates the wrapped weight correctly while
+    # preserving the kernel's single-rounding numerics (computes a*x - b*u in
+    # float32 for the selected slices and writes once); the plain eager
+    # dion2_post_orthogonalize would round the selected slices twice. Plain dense
+    # subclasses such as nn.Parameter are not wrapper subclasses and stay on the
+    # kernel, so the single-GPU/DDP path (where params are not converted by
+    # to_local) keeps the fast path.
+    if any(is_traceable_wrapper_subclass(x) for x in X):
+        from .dion2 import dion2_post_orthogonalize_fused
+
+        dion2_post_orthogonalize_fused(
+            X, U, indices, base_lr, adjusted_lr, weight_decay, select_dim
+        )
+        return
+
+    if not TRITON_AVAILABLE:
+        raise RuntimeError("Triton is required for dion2_post_orthogonalize_triton")
 
     a = (1 - base_lr * weight_decay).item()
     b = adjusted_lr.item()
     SELECT_ROWS = select_dim == -2
 
     for x, u, idx in zip(X, U, indices):
+        # Empty FSDP2 local shard (sharded dim < world_size or uneven chunking):
+        # nothing to write back on this rank. The non-triton path no-ops naturally
+        # via scatter_add_ over an empty index; here we must skip explicitly because
+        # B = x.numel() // (M * N) divides by zero when M or N is 0.
+        if x.numel() == 0:
+            continue
         if not x.is_contiguous():
             raise ValueError("dion2_post_orthogonalize_triton requires contiguous X tensors")
         orig_shape = x.shape
