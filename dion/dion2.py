@@ -349,6 +349,21 @@ def dion2_pre_orthogonalize(
     G = [g.to(dtype=dtype) for g in G]
     torch._foreach_add_(M, G)
 
+    # Empty local shard along select_dim: FSDP2 contiguous chunking leaves this
+    # rank with a size-0 shard when the param's sharded dim is smaller than
+    # world_size (or doesn't divide evenly to fill all ranks). There is nothing
+    # to select here, and topk(k>=1) over a size-0 dimension raises "k not in
+    # range for dimension". Short-circuit with empty submatrices (downstream
+    # megabatch_orthogonalize_async pads these to padded_local_size; the real
+    # orthogonalization runs on the gathered global tensor) and empty index
+    # tensors (post-orthogonalize scatter_add over an empty index is a no-op on
+    # this rank). num_select is a static int at trace time, so this branch is
+    # torch.compile-safe.
+    if num_select == 0:
+        U_selected = [m.to(dtype=torch.bfloat16) for m in M]
+        indices_list = [torch.empty(0, dtype=torch.long, device=M[0].device) for _ in M]
+        return U_selected, indices_list
+
     M_stacked = torch.stack(M, dim=0)
 
     # Compute L1 norm along norm_dim (sum of absolute values)
@@ -428,6 +443,49 @@ def dion2_post_orthogonalize(
         else:
             idx_exp = idx.unsqueeze(-2).expand_as(u_scaled)
         x.scatter_add_(dim=select_dim, index=idx_exp, src=u_scaled)
+
+
+@torch.compile(fullgraph=True)
+def dion2_post_orthogonalize_fused(
+    X: List[Tensor],
+    U: List[Tensor],
+    indices: List[Tensor],
+    base_lr: Tensor,
+    adjusted_lr: Tensor,
+    weight_decay: Tensor,
+    select_dim: int,
+):
+    """
+    Single-rounding weight decay + weight update after orthogonalization.
+
+    Computes the new value of the selected rows/columns as
+    ``(1 - base_lr*weight_decay)*x - adjusted_lr*u`` in float32 and writes it
+    once, matching the single-rounding numerics of the fused Triton kernel
+    (dion2_post_orthogonalize_triton). Unselected entries get the weight decay
+    in place, also a single rounding. This differs from dion2_post_orthogonalize,
+    which writes the weight-decayed weight and then accumulates the update in a
+    second pass, rounding the selected slices twice.
+
+    Only the selected slices are gathered into float32, so the extra work over
+    the in-place weight decay is small. Uses only ``__torch_dispatch__``-routed
+    ops (no raw data_ptr writes), so it is safe for traceable wrapper subclasses
+    such as the MXFP8 training weight wrapper, for which the Triton kernel cannot
+    be used. Inputs should be lists of regular Tensor, not DTensor.
+    """
+    a = 1 - base_lr * weight_decay
+    neg_lr = -adjusted_lr
+    for x, u, idx in zip(X, U, indices):
+        if select_dim == -2:
+            idx_exp = idx.unsqueeze(-1).expand_as(u)
+        else:
+            idx_exp = idx.unsqueeze(-2).expand_as(u)
+        # Fused single-rounding value for the selected slices, computed in float32
+        # from the original weight before any in-place modification.
+        x_sel = a * torch.gather(x, select_dim, idx_exp).float() + neg_lr * u.float()
+        # Weight decay for the unselected entries (single rounding); the selected
+        # slices are overwritten with the fused value below.
+        x.mul_(a)
+        x.scatter_(dim=select_dim, index=idx_exp, src=x_sel.to(x.dtype))
 
 
 # A helper function to print selection choice for each matrix

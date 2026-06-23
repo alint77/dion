@@ -9,12 +9,14 @@ Tests cover:
 - Step timing: optimizer step takes measurable wall-clock time
 """
 
+import os
 import pytest
 import time
 import torch
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CUDA_AVAILABLE = torch.cuda.is_available()
+CUDA_DEVICE_COUNT = torch.cuda.device_count() if CUDA_AVAILABLE else 0
 
 # Bump torch.compile cache size to avoid recompilation failures
 # when the same compiled function sees different input shapes across tests.
@@ -135,6 +137,125 @@ class TestNorMuon:
         params = _make_params([(64, 128)] * 5)
         _run_steps(NorMuon, params, dict(lr=0.01))
 
+
+# ---------------------------------------------------------------------------
+# NorDion2
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
+class TestNorDion2:
+    def test_basic(self):
+        from dion import NorDion2
+        params = _make_params([(64, 128), (128, 64)])
+        _run_steps(NorDion2, params, dict(lr=0.01))
+
+    def test_determinism(self):
+        from dion import NorDion2
+        p1 = _make_params([(64, 128)])
+        r1 = _run_steps(NorDion2, p1, dict(lr=0.01))
+        p2 = _make_params([(64, 128)])
+        r2 = _run_steps(NorDion2, p2, dict(lr=0.01))
+        assert torch.equal(r1[0], r2[0])
+
+    def test_params_change(self):
+        from dion import NorDion2
+        params = _make_params([(64, 128)])
+        before = params[0].data.clone()
+        _run_steps(NorDion2, params, dict(lr=0.01), n_steps=1)
+        assert not torch.equal(params[0].data, before)
+
+    def test_variance_neuron_shape(self):
+        """variance_neuron should have shape [rows, 1]."""
+        from dion import NorDion2
+        params = _make_params([(64, 128)])
+        opt = NorDion2(params, lr=0.01)
+        params[0].grad = torch.randn_like(params[0])
+        opt.step()
+        state = opt.state[params[0]]
+        assert "variance_neuron" in state
+        assert state["variance_neuron"].shape == (64, 1)
+
+    def test_fraction(self):
+        from dion import NorDion2
+        for fraction in [0.1, 0.25, 0.5, 1.0, 1]:
+            params = _make_params([(64, 128)])
+            _run_steps(NorDion2, params, dict(lr=0.01, fraction=fraction))
+            if fraction == 1.0:
+                #ensure all variance values are updated after 1 step as all rows are selected
+                opt = NorDion2(params, lr=0.01, fraction=fraction)
+                params[0].grad = torch.randn_like(params[0])
+                opt.step()
+                v_before = opt.state[params[0]]["variance_neuron"].clone()
+                params[0].grad = torch.randn_like(params[0])
+                opt.step()
+                v_after = opt.state[params[0]]["variance_neuron"]
+                assert (v_after != v_before).all()
+
+    def test_megabatch_same_shape(self):
+        from dion import NorDion2
+        params = _make_params([(64, 128)] * 5)
+        _run_steps(NorDion2, params, dict(lr=0.01))
+
+    def test_output_dtype_matches_param(self):
+        """After optimizer step, param dtype should be unchanged."""
+        from dion import NorDion2
+        for param_dtype in [torch.float32, torch.bfloat16]:
+            params = [torch.nn.Parameter(torch.randn(64, 128, device=DEVICE, dtype=param_dtype))]
+            opt = NorDion2(params, lr=0.01)
+            params[0].grad = torch.randn_like(params[0])
+            opt.step()
+            assert params[0].dtype == param_dtype, (
+                f"param dtype changed from {param_dtype} to {params[0].dtype}"
+            )
+
+    def test_triton_post_ortho(self):
+        """Test that the post-ortho Triton kernel runs without error."""
+        from dion import NorDion2
+        params = _make_params([(64, 128)])
+        opt = NorDion2(params, lr=0.01, triton_post_ortho=True)
+        params[0].grad = torch.randn_like(params[0])
+        opt.step()
+
+    def test_triton_post_ortho_parity(self):
+        """Triton post-ortho should produce same/similar result as eager path."""
+        from dion import NorDion2
+        p1 = _make_params([(64, 128)])
+        r1 = _run_steps(NorDion2, p1, dict(lr=0.01, triton_post_ortho=False))
+        p2 = _make_params([(64, 128)])
+        r2 = _run_steps(NorDion2, p2, dict(lr=0.01, triton_post_ortho=True))
+        torch.testing.assert_close(r1[0], r2[0], atol=1e-5, rtol=1e-5)
+
+    def test_normalize_selected_stacked_matches_unfused(self):
+        from dion.nordion2 import nordion2_normalize_selected_stacked
+        from dion.normuon import normuon_normalization_stacked
+        torch.manual_seed(3)
+        n, rows, cols, k = 4, 16, 32, 8
+        u = torch.randn(n, k, cols, device=DEVICE, dtype=torch.bfloat16)
+        v_full = torch.rand(n, rows, 1, device=DEVICE, dtype=torch.bfloat16)
+        indices = torch.stack(
+            [torch.randperm(rows, device=DEVICE)[:k] for _ in range(n)], dim=0
+        )
+        beta2 = torch.tensor(0.9)
+
+        u_fused, v_fused = nordion2_normalize_selected_stacked(
+            u.clone(), v_full.clone(), indices, beta2
+        )
+
+        idx = indices.unsqueeze(-1)
+        v_sel = torch.gather(v_full, dim=-2, index=idx).float()
+        u_ref, v_sel_new = normuon_normalization_stacked(u.clone(), v_sel, beta2)
+        v_ref = v_full.clone()
+        for i in range(n):
+            v_ref[i].scatter_(dim=-2, index=idx[i], src=v_sel_new[i].to(v_ref.dtype))
+
+        # The fused helper and the reference run through different inductor
+        # fusion groupings (gather/normalize/scatter fused into one graph vs
+        # eager gather/scatter around a separately compiled normalization), so
+        # they are not guaranteed bit-identical: inductor may reorder the fp32
+        # reductions/divisions, leaving last-ULP differences. Compare at the
+        # same fp tolerance as the sibling parity tests.
+        torch.testing.assert_close(u_fused, u_ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(v_fused, v_ref, atol=1e-5, rtol=1e-5)
 
 # ---------------------------------------------------------------------------
 # Dion2
@@ -272,6 +393,14 @@ class TestNumHeads:
     def test_normuon_matches_3d(self):
         from dion import NorMuon
         self._run_parity(NorMuon, dict(lr=0.01))
+
+    def test_nordion2_matches_3d(self):
+        from dion import NorDion2
+        self._run_parity(NorDion2, dict(lr=0.01, fraction=0.5))
+    
+    def test_nordion2_matches_3d_full_fraction(self):
+        from dion import NorDion2
+        self._run_parity(NorDion2, dict(lr=0.01, fraction=1.0))
 
     def test_muon_invalid_num_heads(self):
         from dion import Muon
@@ -528,3 +657,110 @@ class TestTiming:
         t1 = time.perf_counter()
         # Should register nonzero time
         assert t1 > t0
+
+
+# ---------------------------------------------------------------------------
+# Empty FSDP2 local shards (Dion2 / NorDion2)
+# ---------------------------------------------------------------------------
+# FSDP2 contiguous chunking leaves some ranks with an empty (size-0) local
+# shard along the sharded dim when the param's sharded dim is smaller than
+# world_size (or doesn't divide evenly to fill all ranks). dion2_pre_orthogonalize
+# computes topk(k>=1) over that dim, which raised "k not in range for dimension"
+# under torch.compile's fake-tensor pass and deadlocked the remaining ranks at
+# the NCCL all-to-all. These tests pin the empty-shard short-circuit.
+
+def test_dion2_pre_orthogonalize_empty_row_shard():
+    from dion.dion2 import dion2_pre_orthogonalize
+    cols, n = 16, 4
+    M = [torch.zeros(0, cols) for _ in range(n)]
+    G = [torch.randn(0, cols) for _ in range(n)]
+    U, indices = dion2_pre_orthogonalize(
+        G=G, M=M, fraction=0.5, ef_decay=torch.tensor(0.95), select_dim=-2
+    )
+    assert len(U) == n and len(indices) == n
+    for u, idx in zip(U, indices):
+        assert tuple(u.shape) == (0, cols)
+        assert u.dtype == torch.bfloat16
+        assert tuple(idx.shape) == (0,)
+        assert idx.dtype == torch.long
+
+
+def test_dion2_pre_orthogonalize_empty_col_shard():
+    from dion.dion2 import dion2_pre_orthogonalize
+    rows, n = 16, 4
+    M = [torch.zeros(rows, 0) for _ in range(n)]
+    G = [torch.randn(rows, 0) for _ in range(n)]
+    U, indices = dion2_pre_orthogonalize(
+        G=G, M=M, fraction=0.5, ef_decay=torch.tensor(0.95), select_dim=-1
+    )
+    assert len(U) == n and len(indices) == n
+    for u, idx in zip(U, indices):
+        assert tuple(u.shape) == (rows, 0)
+        assert u.dtype == torch.bfloat16
+        assert tuple(idx.shape) == (0,)
+        assert idx.dtype == torch.long
+
+
+def _dion2_empty_shard_step_worker(rank, world_size, global_rows, cols, port, triton_post_ortho):
+    import torch.distributed as dist
+    from torch.distributed.tensor import distribute_tensor, Shard, init_device_mesh
+    from dion import Dion2
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    torch.cuda.set_device(rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    mesh = init_device_mesh("cuda", (world_size,))
+    device = torch.device(f"cuda:{rank}")
+
+    torch.manual_seed(0)
+    full = torch.randn(global_rows, cols, device=device)
+    # Row-sharded over world_size: ranks beyond ceil(global_rows / world_size)
+    # contiguous chunks hold an empty (0, cols) local shard.
+    param = torch.nn.Parameter(distribute_tensor(full, mesh, [Shard(0)]))
+    before = param.to_local().clone()
+
+    opt = Dion2([param], distributed_mesh=mesh, lr=0.01, triton_post_ortho=triton_post_ortho)
+    for step in range(3):
+        torch.manual_seed(step + 1)
+        g = torch.randn(global_rows, cols, device=device)
+        param.grad = distribute_tensor(g, mesh, [Shard(0)])
+        opt.step()
+
+    local_after = param.to_local()
+    if local_after.shape[0] > 0:
+        assert not torch.equal(local_after, before), f"rank {rank}: weights did not update"
+    else:
+        assert torch.equal(local_after, before), f"rank {rank}: empty shard mutated"
+    dist.destroy_process_group()
+
+
+# triton_post_ortho=True exercises dion2_post_orthogonalize_triton, whose
+# B = x.numel() // (M * N) divides by zero on the empty (0, cols) shard unless
+# the empty rank is skipped; the default (False) path no-ops via scatter_add_.
+@pytest.mark.parametrize("triton_post_ortho", [False, True])
+@pytest.mark.parametrize(
+    "world_size, global_rows",
+    [
+        (2, 1),  # rank 1 holds an empty (0, cols) shard
+        (4, 2),  # ranks 2 and 3 empty
+        (4, 5),  # chunk sizes (2, 2, 1, 0): rank 3 empty (mirrors sparse-3b (18, D)/8)
+    ],
+)
+def test_dion2_optimizer_step_with_empty_shard(world_size, global_rows, triton_post_ortho):
+    import torch.multiprocessing as mp
+
+    if CUDA_DEVICE_COUNT < world_size:
+        pytest.skip(f"needs >= {world_size} CUDA devices for NCCL alltoall")
+    if triton_post_ortho:
+        try:
+            import triton  # noqa: F401
+        except ImportError:
+            pytest.skip("triton not installed")
+    port = 29800 + world_size * 10 + global_rows + (1000 if triton_post_ortho else 0)
+    mp.spawn(
+        _dion2_empty_shard_step_worker,
+        args=(world_size, global_rows, 16, port, triton_post_ortho),
+        nprocs=world_size,
+        join=True,
+    )
