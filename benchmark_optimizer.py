@@ -23,9 +23,11 @@ import argparse
 import dataclasses
 import json
 import os
+import time
 import torch
 import torch.distributed as dist
 from datetime import datetime
+from pathlib import Path
 
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DeviceMesh
@@ -143,8 +145,22 @@ def benchmark_optimizer_step(
     num_iterations: int = 100,
 ):
     """
-    Time optimizer.step() using CUDA events for accurate GPU timing.
-    Returns median time in milliseconds.
+    Time optimizer.step() with two independent clocks per iteration:
+
+      - CPU (host) time via time.perf_counter(), stopped right after step()
+        returns and BEFORE any device sync -- this captures the host cost of
+        step() itself (kernel launch, Python overhead, and any host-side syncs
+        the optimizer performs internally). If the optimizer never host-syncs,
+        this is small and roughly constant regardless of GPU work.
+      - GPU (device) time via CUDA events, which read the GPU's own clock
+        between two stream markers -- pure device execution time of the kernels
+        step() enqueued.
+
+    The two are not subsets of each other: cpu ~= gpu means the optimizer
+    host-syncs (CPU dragged along with the GPU); cpu << gpu means GPU-bound;
+    cpu large with gpu small means launch/Python-bound.
+
+    Returns (median_gpu_ms, gpu_times_ms, median_cpu_ms, cpu_times_ms).
     """
     # Warmup
     for _ in range(num_warmup):
@@ -155,25 +171,33 @@ def benchmark_optimizer_step(
     torch.cuda.synchronize()
 
     # Timed iterations
-    times_ms = []
+    gpu_times_ms = []
+    cpu_times_ms = []
     for _ in range(num_iterations):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
+        # Excluded from both timers: fake-gradient allocation is harness setup,
+        # not part of step().
         assign_fake_gradients(model)
 
+        t0 = time.perf_counter()
         start.record()
         optimizer.step()
         end.record()
+        t1 = time.perf_counter()  # STOP CPU clock before the device sync
+        cpu_times_ms.append((t1 - t0) * 1e3)
 
-        torch.cuda.synchronize()
-        times_ms.append(start.elapsed_time(end))
+        torch.cuda.synchronize()  # now both events have completed
+        gpu_times_ms.append(start.elapsed_time(end))
 
         optimizer.zero_grad()
 
-    times_ms.sort()
-    median_ms = times_ms[len(times_ms) // 2]
-    return median_ms, times_ms
+    gpu_times_ms.sort()
+    cpu_times_ms.sort()
+    median_gpu_ms = gpu_times_ms[len(gpu_times_ms) // 2]
+    median_cpu_ms = cpu_times_ms[len(cpu_times_ms) // 2]
+    return median_gpu_ms, gpu_times_ms, median_cpu_ms, cpu_times_ms
 
 
 def build_and_benchmark(
@@ -194,7 +218,9 @@ def build_and_benchmark(
         num_iterations: Number of timed iterations.
 
     Returns:
-        Dict with keys: "median_ms", "times_ms", "num_params", "hp".
+        Dict with keys: "median_ms"/"times_ms" (GPU/device time, kept under the
+        original names for back-compat), "cpu_median_ms"/"cpu_times_ms" (host
+        time), "num_params", "hp".
 
     Note: Distributed must already be initialized before calling this.
           Call init_distributed_benchmark() first.
@@ -242,13 +268,15 @@ def build_and_benchmark(
     model, optimizer = build_model_and_optimizer(hp, cli_args, device_mesh)
     num_params = sum(p.numel() for p in model.parameters())
 
-    median_ms, times_ms = benchmark_optimizer_step(
+    median_ms, times_ms, cpu_median_ms, cpu_times_ms = benchmark_optimizer_step(
         model, optimizer, num_warmup=num_warmup, num_iterations=num_iterations
     )
 
     return {
-        "median_ms": median_ms,
+        "median_ms": median_ms,      # GPU/device time (back-compat name)
         "times_ms": times_ms,
+        "cpu_median_ms": cpu_median_ms,  # CPU/host time
+        "cpu_times_ms": cpu_times_ms,
         "num_params": num_params,
         "hp": hp,
         "gpu_name": torch.cuda.get_device_name(0),
@@ -287,11 +315,18 @@ def main():
     print0(f"Optimizer: {hp.optimizer}")
     print0(f"Model dim: {hp.model_dim}, Layers: {hp.n_layer}, Heads: {hp.n_head}")
     print0(f"Total parameters: {result['num_params']:,}")
-    print0(f"\nResults:")
+    gpu_t = result["times_ms"]
+    cpu_t = result["cpu_times_ms"]
+    print0(f"\nGPU (device) time -- CUDA events:")
     print0(f"  Median: {result['median_ms']:.3f} ms")
-    print0(f"  Min:    {min(result['times_ms']):.3f} ms")
-    print0(f"  Max:    {max(result['times_ms']):.3f} ms")
-    print0(f"  Mean:   {sum(result['times_ms'])/len(result['times_ms']):.3f} ms")
+    print0(f"  Min:    {min(gpu_t):.3f} ms")
+    print0(f"  Max:    {max(gpu_t):.3f} ms")
+    print0(f"  Mean:   {sum(gpu_t)/len(gpu_t):.3f} ms")
+    print0(f"\nCPU (host) time -- perf_counter, stopped before device sync:")
+    print0(f"  Median: {result['cpu_median_ms']:.3f} ms")
+    print0(f"  Min:    {min(cpu_t):.3f} ms")
+    print0(f"  Max:    {max(cpu_t):.3f} ms")
+    print0(f"  Mean:   {sum(cpu_t)/len(cpu_t):.3f} ms")
     print0("=" * 80)
 
     if dist.is_initialized():
@@ -369,21 +404,24 @@ def sweep(name: Optional[str] = None):
         result["overrides"] = sweep_overrides
         results.append(result)
 
-        print0(f"  Median: {result['median_ms']:.3f} ms")
+        print0(
+            f"  GPU median: {result['median_ms']:.3f} ms | "
+            f"CPU median: {result['cpu_median_ms']:.3f} ms"
+        )
 
     # Summary table
     override_strs = [str(r["overrides"]) for r in results]
     col_width = min(200, max(len(s) for s in override_strs))
-    table_width = col_width + 42  # account for other columns and separators
+    table_width = col_width + 30  # account for the two median columns
     print0(f"\n{'=' * table_width}")
     print0("SWEEP RESULTS")
     print0(f"{'=' * table_width}")
-    print0(f"{'Overrides':<{col_width}s} | {'Median (ms)':>12s} | {'Min (ms)':>10s} | {'Max (ms)':>10s}")
+    print0(f"{'Overrides':<{col_width}s} | {'GPU med (ms)':>12s} | {'CPU med (ms)':>12s}")
     print0("-" * table_width)
     for r, os_str in zip(results, override_strs):
         print0(
             f"{os_str:<{col_width}s} | {r['median_ms']:>12.3f} | "
-            f"{min(r['times_ms']):>10.3f} | {max(r['times_ms']):>10.3f}"
+            f"{r['cpu_median_ms']:>12.3f}"
         )
     print0("=" * table_width)
 
@@ -406,12 +444,76 @@ def sweep(name: Optional[str] = None):
     return results
 
 
-def profile():
+def _make_bench_profiler(
+    output_dir: str,
+    is_main: bool,
+    wait: int,
+    warmup: int,
+    active: int,
+):
+    """Build a scheduled PyTorch profiler + per-iteration step callback.
+
+    Mirrors nanoplm's pure-pipeline profiler (``_make_pure_profiler``): a single
+    ``torch.profiler.schedule(wait, warmup, active, repeat=1)`` window that
+    exports a Chrome trace to ``output_dir/profiler_traces/chrome_trace.json``
+    on completion. The nsys/NCU CUDA-Profiler-API branch is intentionally
+    omitted here.
+
+    Usage:
+        prof_ctx, step_cb = _make_bench_profiler(...)
+        with prof_ctx:
+            for _ in range(total_iters):
+                ...one optimizer step...
+                step_cb()
+
+    Returns (context_manager, step_callback). On non-main ranks the profiler is
+    disabled (null context + no-op callback).
     """
-    Profile optimizer.step() and export a Chrome trace.
+    from contextlib import nullcontext
+
+    if not is_main:
+        return nullcontext(), lambda: None
+
+    trace_dir = Path(output_dir) / "profiler_traces"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    trace_path = trace_dir / "chrome_trace.json"
+
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+    def on_trace_ready(prof: torch.profiler.profile) -> None:
+        prof.export_chrome_trace(str(trace_path))
+        print0(f"Exported PyTorch profiler trace to {trace_path}")
+
+    prof = torch.profiler.profile(
+        activities=activities,
+        # Single profiling window; avoid repeating the cycle.
+        schedule=torch.profiler.schedule(
+            wait=wait, warmup=warmup, active=active, repeat=1
+        ),
+        on_trace_ready=on_trace_ready,
+        # Match nanoplm's pure-pipeline profiler: record_shapes only, NO
+        # with_stack. with_stack=True emits a python_function event per Python
+        # frame (tens of thousands), flooding the CPU track with call-stack
+        # detail nanoplm's trace does not have. Drop it so the two traces match.
+        record_shapes=True,
+    )
+    print0(
+        f"Profiling enabled (PyTorch): schedule wait={wait} warmup={warmup} "
+        f"active={active}; trace -> {trace_path}. Open in chrome://tracing"
+    )
+    return prof, lambda: prof.step()
+
+
+def profile(wait: int = 5, warmup: int = 1, active: int = 3, output_dir: str = "."):
+    """
+    Profile optimizer.step() with a scheduled PyTorch profiler and export a
+    Chrome trace (nanoplm pure-pipeline style; no nsys/NCU mode).
 
     Usage:
       torchrun --standalone --nproc_per_node=1 benchmark_optimizer.py profile --config configs/benchmark_optimizer.yaml
+      # optional: --profile_wait 5 --profile_warmup 1 --profile_active 3 --profile_out .
     """
     torch._dynamo.config.cache_size_limit = 100
 
@@ -428,6 +530,7 @@ def profile():
 
     model, optimizer = build_model_and_optimizer(hp, cli_args, device_mesh)
 
+    is_main = int(os.environ.get("RANK", 0)) == 0
     print0("=" * 80)
     print0("Profiling optimizer step")
     print0(f"GPU: {torch.cuda.get_device_name(0)}")
@@ -435,33 +538,19 @@ def profile():
     print0(f"Model dim: {hp.model_dim}, Layers: {hp.n_layer}, Heads: {hp.n_head}")
     print0("=" * 80)
 
-    # Warmup
-    num_warmup = 5
-    for _ in range(num_warmup):
-        assign_fake_gradients(model)
-        optimizer.step()
-        optimizer.zero_grad()
-    torch.cuda.synchronize()
+    prof_ctx, profiler_step_cb = _make_bench_profiler(
+        output_dir=output_dir, is_main=is_main, wait=wait, warmup=warmup, active=active
+    )
 
-    # Profile
-    num_profiled = 3
-    print0(f"Capturing {num_profiled} profiled iterations...")
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        with_stack=True,
-    ) as prof:
-        for _ in range(num_profiled):
+    # The schedule consumes wait + warmup + active steps; run exactly that many.
+    total_iters = wait + warmup + active
+    print0(f"Running {total_iters} steps ({wait} wait + {warmup} warmup + {active} active)...")
+    with prof_ctx:
+        for _ in range(total_iters):
             assign_fake_gradients(model)
             optimizer.step()
             optimizer.zero_grad()
-
-    trace_path = "optimizer_trace.json"
-    prof.export_chrome_trace(trace_path)
-    print0(f"Trace exported to: {trace_path}")
-    print0("Open in chrome://tracing or https://ui.perfetto.dev")
+            profiler_step_cb()
 
     if dist.is_initialized():
         dist.destroy_process_group()
@@ -481,6 +570,21 @@ if __name__ == "__main__":
         sweep(name=sweep_name)
     elif len(sys.argv) > 1 and sys.argv[1] == "profile":
         sys.argv.pop(1)
-        profile()
+        # Extract profiler-window flags before parse_cli_args (which rejects
+        # unknown args). Same pattern as sweep's --name handling above.
+        def _pop_flag(name, default, cast):
+            if name in sys.argv:
+                idx = sys.argv.index(name)
+                val = sys.argv[idx + 1]
+                sys.argv.pop(idx)  # flag
+                sys.argv.pop(idx)  # value
+                return cast(val)
+            return default
+
+        p_wait = _pop_flag("--profile_wait", 5, int)
+        p_warmup = _pop_flag("--profile_warmup", 1, int)
+        p_active = _pop_flag("--profile_active", 3, int)
+        p_out = _pop_flag("--profile_out", ".", str)
+        profile(wait=p_wait, warmup=p_warmup, active=p_active, output_dir=p_out)
     else:
         main()

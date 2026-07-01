@@ -193,12 +193,14 @@ class GPT(nn.Module):
         else:
             return loss
 
-    def compile(self):
+    def compile(self, dynamic=None):
         # Workaround for issue where torch.compile fails for embedding layer
         # Compile embedding separately from rest of the model
         # https://github.com/pytorch/torchtitan/issues/534
-        self._forward = torch.compile(self._forward)
-        self._forward_emb = torch.compile(self._forward_emb)
+        # Compiling the inner methods in place (rather than wrapping the module)
+        # preserves the module type, so FSDPModule isinstance checks still hold.
+        self._forward = torch.compile(self._forward, dynamic=dynamic)
+        self._forward_emb = torch.compile(self._forward_emb, dynamic=dynamic)
 
     @torch.no_grad()
     def generate(
